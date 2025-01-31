@@ -49,7 +49,7 @@ class InputValues:
         self.max_depth_range_meter: float = float(self.max_depth_range_meter)
 
 
-@rr.thread_local_stream("rerun_example_streaming_blur")
+@rr.thread_local_stream("rerun_prompt_da")
 def stream_polycam_da(
     *input_params,
     progress=gr.Progress(),  # noqa: B008
@@ -128,7 +128,7 @@ with gr.Blocks() as prompt_da_block:
             label="Polycam Zip Path", file_count="single", file_types=["zip"]
         )
         with gr.Column():
-            stream_blur = gr.Button("Stream Repeated Blur")
+            stream_blur = gr.Button("Run PromptDA")
             with gr.Accordion("Advanced Settings", open=False):
                 max_depth_range_meter = gr.Number(
                     label="Max Depth Range (m)", value=4.0, precision=2

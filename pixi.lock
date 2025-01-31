@@ -6431,7 +6431,7 @@ packages:
 - pypi: .
   name: rerun-prompt-da
   version: 0.1.0
-  sha256: 5b608ae7d07670cbb7017ecfc6990ca9b8402c05ddf076937a74cadcf9cdcb80
+  sha256: fe8799b10f71ebe025489dc5d13093d7bcaad40ef8bed5dcc49484ac9d4f9301
   requires_python: '>=3.11'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-64/rerun-sdk-0.21.0-py311h5ef25c5_0.conda
