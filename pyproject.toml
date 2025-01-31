@@ -41,6 +41,34 @@ xformers = ">=0.0.27,<0.0.28"
 open3d = ">=0.19.0,<0.20"
 
 [tool.pixi.tasks]
+polycam-prompt_da = { cmd = "python tools/prompt_da_polycam.py --polycam-zip-path data/6G-bookcase-poly.zip", description = "Run the polycam prompt_da", depends-on = [
+    "_download-example",
+] }
+
+[tool.pixi.tasks._download-example]
+cmd = """
+    test -e data/6G-bookcase-poly.zip
+    || (
+        huggingface-cli download pablovela5620/polycam-example-data \
+        6G-bookcase-poly.zip --repo-type dataset \
+        --local-dir data/
+    )
+    """
+outputs = ["data/6G-bookcase-poly.zip"]
+description = "Downloads an example polycam dataset from huggingface"
+
+[tool.pixi.feature.app.dependencies]
+gradio = "<5"
+
+[tool.pixi.feature.app.pypi-dependencies]
+gradio-rerun = { url = "https://huggingface.co/datasets/pablovela5620/gradio4-rerun-0.21/resolve/main/dist/gradio_rerun-0.0.10-py3-none-any.whl" }
+
+[tool.pixi.feature.app.tasks]
+app = { cmd = "python tools/gradio_app.py", description = "Run the gradio app" }
+dev-app = { cmd = "gradio tools/gradio_app.py", description = "Run the gradio app in dev mode" }
+
+[tool.pixi.environments]
+app = { features = ["app"], solve-group = "default" }
 
 [tool.ruff]
 line-length = 120

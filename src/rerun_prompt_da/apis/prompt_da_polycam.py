@@ -4,6 +4,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 from jaxtyping import UInt8, UInt16
 from monopriors.depth_completion_models.base_completion_depth import (
     CompletionDepthPrediction,
@@ -26,7 +27,10 @@ from tqdm import tqdm
 class PDAPolycamConfig:
     polycam_zip_path: Path
     rr_config: RerunTyroConfig
-    max_size: int = 1008
+    max_image_size: int = 1008
+    max_depth_range_meter: float = 4.0
+    depth_fusion_resolution: float = 0.04
+    log_incremental_mesh: bool = True
 
 
 def log_polycam_data(
@@ -79,20 +83,44 @@ def filter_depth(
     return filtered_depth_mm
 
 
+def create_blueprint(parent_log_path: Path) -> rrb.Blueprint:
+    blueprint = rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Spatial3DView(),
+            rrb.Vertical(
+                rrb.Spatial2DView(
+                    origin=parent_log_path / "cam" / "pinhole" / "arkit_depth"
+                ),
+                rrb.Spatial2DView(
+                    origin=parent_log_path / "cam" / "pinhole" / "pred_depth"
+                ),
+            ),
+            column_shares=[20, 9],
+        ),
+        collapse_panels=True,
+    )
+    return blueprint
+
+
 def pda_polycam_inference(
     config: PDAPolycamConfig,
 ) -> None:
-    parent_path: Path = Path("world")
+    parent_log_path: Path = Path("world")
     rr.log("/", rr.ViewCoordinates.RUB, timeless=True)
+
+    blueprint: rrb.Blueprint = create_blueprint(parent_log_path)
+    rr.send_blueprint(blueprint=blueprint)
     polycam_dataset: PolycamDataset = load_polycam_data(
         polycam_zip_or_directory_path=config.polycam_zip_path
     )
 
-    max_depth_meter: float = 4.0
-    pred_fuser = Open3DFuser(fusion_resolution=0.04, max_fusion_depth=max_depth_meter)
+    pred_fuser = Open3DFuser(
+        fusion_resolution=config.depth_fusion_resolution,
+        max_fusion_depth=config.max_depth_range_meter,
+    )
 
     model = PromptDAPredictor(
-        device="cuda", model_type="large", max_size=config.max_size
+        device="cuda", model_type="large", max_size=config.max_image_size
     )
     pbar = tqdm(polycam_dataset, desc="Inferring", total=len(polycam_dataset))
     polycam_data: PolycamData
@@ -108,7 +136,7 @@ def pda_polycam_inference(
             depth_mm=depth_pred.depth_mm,
             confidence=polycam_data.confidence_hw,
             confidence_threshold=DepthConfidenceLevel.MEDIUM,
-            max_depth_meter=max_depth_meter,
+            max_depth_meter=config.max_depth_range_meter,
         )
 
         # fuse the predicted depth and the ground truth depth
@@ -120,30 +148,31 @@ def pda_polycam_inference(
         )
 
         log_polycam_data(
-            parent_path=parent_path,
+            parent_path=parent_log_path,
             polycam_data=polycam_data,
             depth_pred=depth_pred.depth_mm,
             rescale_factor=1,
         )
 
-        pred_mesh = pred_fuser.get_mesh()
-        pred_mesh.compute_vertex_normals()
+        if config.log_incremental_mesh:
+            pred_mesh = pred_fuser.get_mesh()
+            pred_mesh.compute_vertex_normals()
 
-        rr.log(
-            f"{parent_path}/pred_mesh",
-            rr.Mesh3D(
-                vertex_positions=pred_mesh.vertices,
-                triangle_indices=pred_mesh.triangles,
-                vertex_normals=pred_mesh.vertex_normals,
-                vertex_colors=pred_mesh.vertex_colors,
-            ),
-        )
+            rr.log(
+                f"{parent_log_path}/pred_mesh",
+                rr.Mesh3D(
+                    vertex_positions=pred_mesh.vertices,
+                    triangle_indices=pred_mesh.triangles,
+                    vertex_normals=pred_mesh.vertex_normals,
+                    vertex_colors=pred_mesh.vertex_colors,
+                ),
+            )
 
     pred_mesh = pred_fuser.get_mesh()
     pred_mesh.compute_vertex_normals()
 
     rr.log(
-        f"{parent_path}/pred_mesh",
+        f"{parent_log_path}/pred_mesh",
         rr.Mesh3D(
             vertex_positions=pred_mesh.vertices,
             triangle_indices=pred_mesh.triangles,
