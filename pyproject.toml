@@ -64,8 +64,12 @@ gradio = "<5"
 gradio-rerun = { url = "https://huggingface.co/datasets/pablovela5620/gradio4-rerun-0.21/resolve/main/dist/gradio_rerun-0.0.10-py3-none-any.whl" }
 
 [tool.pixi.feature.app.tasks]
-app = { cmd = "python tools/gradio_app.py", description = "Run the gradio app" }
-dev-app = { cmd = "gradio tools/gradio_app.py", description = "Run the gradio app in dev mode" }
+app = { cmd = "python tools/gradio_app.py", description = "Run the gradio app", depends-on = [
+    "_download-example",
+] }
+dev-app = { cmd = "gradio tools/gradio_app.py", description = "Run the gradio app in dev mode", depends-on = [
+    "_download-example",
+] }
 
 [tool.pixi.environments]
 app = { features = ["app"], solve-group = "default" }
