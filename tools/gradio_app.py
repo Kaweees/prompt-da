@@ -1,3 +1,5 @@
+from argparse import ArgumentParser
+
 import gradio as gr
 
 from rerun_prompt_da.gradio_ui.prompt_da_ui import prompt_da_block
@@ -29,4 +31,7 @@ with gr.Blocks() as demo:
         prompt_da_block.render()
 
 if __name__ == "__main__":
-    demo.launch()
+    parser = ArgumentParser()
+    parser.add_argument("--share", action="store_true")
+    args = parser.parse_args()
+    demo.launch(share=args.share)

@@ -1,7 +1,7 @@
-from collections.abc import Generator
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+import beartype
 import gradio as gr
 import numpy as np
 import rerun as rr
@@ -54,7 +54,17 @@ def stream_polycam_da(
     *input_params,
     progress=gr.Progress(),  # noqa: B008
 ):
-    parameters = InputValues(*input_params)
+    try:
+        parameters = InputValues(*input_params)
+    except beartype.roar.BeartypeCallHintParamViolation as e:
+        raise gr.Error(  # noqa: B904
+            "Did you make sure the zipfile finished uploading?. Try to hit run again.",
+            duration=20,
+        )
+    except Exception as e:
+        raise gr.Error(  # noqa: B904
+            f"Error: {e}\n Did you wait for zip file to upload?", duration=20
+        )
 
     stream: rr.BinaryStream = rr.binary_stream()
 
@@ -122,13 +132,29 @@ def stream_polycam_da(
         yield stream.read()
 
 
+instructions = """
+    # Instructions to Generate Zip
+    - iPhone 12 Pro or later Pro models, iPad 2020 Pro or later Pro models.
+    - Free iOS App: [Polycam](https://poly.cam/get-the-app).
+    # Steps:
+    - Follow instructions provided in the [nerfstudio guide](https://docs.nerf.studio/quickstart/custom_dataset.html#polycam-capture) to generate a zip file.
+"""
 with gr.Blocks() as prompt_da_block:
     with gr.Row():
-        polycam_zip_path = gr.File(
-            label="Polycam Zip Path", file_count="single", file_types=["zip"]
-        )
         with gr.Column():
-            stream_blur = gr.Button("Run PromptDA")
+            polycam_zip_path = gr.File(
+                label="Polycam Zip Path",
+                file_count="single",
+                file_types=["zip"],
+                height=100,
+            )
+            with gr.Accordion("Instructions to Generate Zip", open=False):
+                gr.Markdown(instructions)
+
+        with gr.Column():
+            with gr.Row():
+                prompt_da_btn = gr.Button("Run PromptDA")
+                stop_prompt_da_btn = gr.Button("Stop PromptDA")
             with gr.Accordion("Advanced Settings", open=False):
                 max_depth_range_meter = gr.Number(
                     label="Max Depth Range (m)", value=4.0, precision=2
@@ -163,6 +189,7 @@ with gr.Blocks() as prompt_da_block:
         inputs=input_params.to_list(),
         outputs=[viewer],
     )
-    stream_blur.click(
+    prompt_da_event = prompt_da_btn.click(
         stream_polycam_da, inputs=input_params.to_list(), outputs=[viewer]
     )
+    stop_prompt_da_btn.click(fn=None, inputs=[], outputs=[], cancels=[prompt_da_event])
