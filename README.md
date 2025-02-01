@@ -1,4 +1,25 @@
-# Prompt Depth Anything Example
+# Prompt Depth Anything with Rerun
+An unofficial implementation of Prompting Depth Anything for 4K Resolution Accurate Metric Depth Estimation. Using the high resolution depth maps for 3D reconstruction
+
+Uses [Rerun](https://rerun.io/) to visualize, [Gradio](https://www.gradio.app) for an interactive UI, and [Pixi](https://pixi.sh/latest/) for a easy installation
+
+<p align="center">
+    <a title="Website" href="https://promptda.github.io/" target="_blank" rel="noopener noreferrer" style="display: inline-block;">
+        <img src="https://www.obukhov.ai/img/badges/badge-website.svg">
+    </a>
+        <img src="https://www.obukhov.ai/img/badges/badge-pdf.svg">
+    </a>
+    <a title="Github" href="https://github.com/rerun-io/prompt-da" target="_blank" rel="noopener noreferrer" style="display: inline-block;">
+        <img src="https://img.shields.io/github/stars/pablovela5620/InstantSplat?label=GitHub%20%E2%98%85&logo=github&color=C8C" alt="badge-github-stars">
+    </a>
+    <a title="Social" href="https://x.com/pablovelagomez1" target="_blank" rel="noopener noreferrer" style="display: inline-block;">
+        <img src="https://www.obukhov.ai/img/badges/badge-social.svg" alt="social">
+    </a>
+  </p>
+
+<p align="center">
+  <img src="media/promptda-github-demo.gif" alt="example output" width="720" />
+</p>
 
 ## Installation
 ### Using Pixi

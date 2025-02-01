@@ -47,14 +47,14 @@ polycam-prompt_da = { cmd = "python tools/prompt_da_polycam.py --polycam-zip-pat
 
 [tool.pixi.tasks._download-example]
 cmd = """
-    test -e data/6G-bookcase-poly.zip
+    test -e data/6G-room-example.zip
     || (
         huggingface-cli download pablovela5620/polycam-example-data \
-        6G-bookcase-poly.zip --repo-type dataset \
+        6G-room-example.zip --repo-type dataset \
         --local-dir data/
     )
     """
-outputs = ["data/6G-bookcase-poly.zip"]
+outputs = ["data/6G-room-example.zip"]
 description = "Downloads an example polycam dataset from huggingface"
 
 [tool.pixi.feature.app.dependencies]

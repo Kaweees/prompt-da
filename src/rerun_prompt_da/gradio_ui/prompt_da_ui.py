@@ -183,8 +183,7 @@ with gr.Blocks() as prompt_da_block:
     )
     examples = gr.Examples(
         examples=[
-            ["data/6G-bookcase-poly.zip", 4.0, 0.01],
-            ["data/6G-bookcase-poly.zip", 4.0, 0.08],
+            ["data/6G-room-example.zip", 4.0, 0.02],
         ],
         inputs=input_params.to_list(),
         outputs=[viewer],
