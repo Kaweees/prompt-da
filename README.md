@@ -9,11 +9,11 @@ Uses [Rerun](https://rerun.io/) to visualize, [Gradio](https://www.gradio.app) f
       </a>
     <a title="Website" href="https://promptda.github.io/" target="_blank" rel="noopener noreferrer" style="display: inline-block;">
         <img src="https://www.obukhov.ai/img/badges/badge-website.svg">
-    </a>
+    <a title="arXiv" href="https://arxiv.org/abs/2412.14015" target="_blank" rel="noopener noreferrer" style="display: inline-block;">
         <img src="https://www.obukhov.ai/img/badges/badge-pdf.svg">
     </a>
     <a title="Github" href="https://github.com/rerun-io/prompt-da" target="_blank" rel="noopener noreferrer" style="display: inline-block;">
-        <img src="https://img.shields.io/github/stars/pablovela5620/InstantSplat?label=GitHub%20%E2%98%85&logo=github&color=C8C" alt="badge-github-stars">
+        <img src="https://img.shields.io/github/stars/rerun-io/prompt-da?label=GitHub%20%E2%98%85&logo=github&color=C8C" alt="badge-github-stars">
     </a>
     <a title="Social" href="https://x.com/pablovelagomez1" target="_blank" rel="noopener noreferrer" style="display: inline-block;">
         <img src="https://www.obukhov.ai/img/badges/badge-social.svg" alt="social">
