@@ -70,12 +70,10 @@ def stream_polycam_da(
 
     polycam_zip_path = Path(parameters.polycam_zip_path)
     parent_log_path: Path = Path("world")
-    rr.log("/", rr.ViewCoordinates.RUB, timeless=True)
+    rr.log("/", rr.ViewCoordinates.RUB, static=True)
     blueprint: rrb.Blueprint = create_blueprint(parent_log_path=parent_log_path)
     rr.send_blueprint(blueprint)
-    polycam_dataset: PolycamDataset = load_polycam_data(
-        polycam_zip_or_directory_path=polycam_zip_path
-    )
+    polycam_dataset: PolycamDataset = load_polycam_data(polycam_zip_or_directory_path=polycam_zip_path)
 
     pred_fuser = Open3DFuser(
         fusion_resolution=parameters.depth_fusion_resolution,
@@ -156,9 +154,7 @@ with gr.Blocks() as prompt_da_block:
                 prompt_da_btn = gr.Button("Run PromptDA")
                 stop_prompt_da_btn = gr.Button("Stop PromptDA")
             with gr.Accordion("Advanced Settings", open=False):
-                max_depth_range_meter = gr.Number(
-                    label="Max Depth Range (m)", value=4.0, precision=2
-                )
+                max_depth_range_meter = gr.Number(label="Max Depth Range (m)", value=4.0, precision=2)
                 depth_fusion_resolution = gr.Slider(
                     minimum=0.01,
                     maximum=0.08,
@@ -188,7 +184,5 @@ with gr.Blocks() as prompt_da_block:
         inputs=input_params.to_list(),
         outputs=[viewer],
     )
-    prompt_da_event = prompt_da_btn.click(
-        stream_polycam_da, inputs=input_params.to_list(), outputs=[viewer]
-    )
+    prompt_da_event = prompt_da_btn.click(stream_polycam_da, inputs=input_params.to_list(), outputs=[viewer])
     stop_prompt_da_btn.click(fn=None, inputs=[], outputs=[], cancels=[prompt_da_event])

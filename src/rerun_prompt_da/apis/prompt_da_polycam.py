@@ -88,12 +88,8 @@ def create_blueprint(parent_log_path: Path) -> rrb.Blueprint:
         rrb.Horizontal(
             rrb.Spatial3DView(),
             rrb.Vertical(
-                rrb.Spatial2DView(
-                    origin=parent_log_path / "cam" / "pinhole" / "arkit_depth"
-                ),
-                rrb.Spatial2DView(
-                    origin=parent_log_path / "cam" / "pinhole" / "pred_depth"
-                ),
+                rrb.Spatial2DView(origin=parent_log_path / "cam" / "pinhole" / "arkit_depth"),
+                rrb.Spatial2DView(origin=parent_log_path / "cam" / "pinhole" / "pred_depth"),
             ),
             column_shares=[20, 9],
         ),
@@ -106,22 +102,19 @@ def pda_polycam_inference(
     config: PDAPolycamConfig,
 ) -> None:
     parent_log_path: Path = Path("world")
-    rr.log("/", rr.ViewCoordinates.RUB, timeless=True)
+    rr.log("/", rr.ViewCoordinates.RUB, static=True)
 
     blueprint: rrb.Blueprint = create_blueprint(parent_log_path)
     rr.send_blueprint(blueprint=blueprint)
-    polycam_dataset: PolycamDataset = load_polycam_data(
-        polycam_zip_or_directory_path=config.polycam_zip_path
-    )
+    polycam_zip_path: Path = config.polycam_zip_path
+    polycam_dataset: PolycamDataset = load_polycam_data(polycam_zip_or_directory_path=polycam_zip_path)
 
     pred_fuser = Open3DFuser(
         fusion_resolution=config.depth_fusion_resolution,
         max_fusion_depth=config.max_depth_range_meter,
     )
 
-    model = PromptDAPredictor(
-        device="cuda", model_type="large", max_size=config.max_image_size
-    )
+    model = PromptDAPredictor(device="cuda", model_type="large", max_size=config.max_image_size)
     pbar = tqdm(polycam_dataset, desc="Inferring", total=len(polycam_dataset))
     polycam_data: PolycamData
     for frame_idx, polycam_data in enumerate(pbar):

@@ -51,7 +51,7 @@ av = ">=16.0.1,<17"
 gradio-rerun = "==0.25.1"
 
 [tool.pixi.tasks]
-polycam-prompt_da = { cmd = "python tools/prompt_da_polycam.py --polycam-zip-path data/6G-bookcase-poly.zip", description = "Run the polycam prompt_da", depends-on = [
+polycam-prompt_da = { cmd = "python tools/prompt_da_polycam.py --polycam-zip-path data/6G-room-example.zip", description = "Run the polycam prompt_da", depends-on = [
     "_download-example",
 ] }
 
