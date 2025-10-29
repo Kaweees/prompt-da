@@ -145,7 +145,7 @@ with gr.Blocks() as prompt_da_block:
             polycam_zip_path = gr.File(
                 label="Polycam Zip Path",
                 file_count="single",
-                file_types=["zip"],
+                file_types=[".zip"],
                 height=100,
             )
             with gr.Accordion("Instructions to Generate Zip", open=False):

@@ -3,42 +3,52 @@ authors = [{ name = "pablovela5620", email = "pablovela5620@gmail.com" }]
 dependencies = []
 description = "Add a short description here"
 name = "rerun-prompt-da"
-requires-python = ">= 3.11"
+requires-python = ">= 3.12"
 version = "0.1.0"
 
 [build-system]
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
-[tool.pixi.project]
+[tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
 [tool.pixi.system-requirements]
-cuda = "12.0"
+cuda = "12.8"
 
 [tool.pixi.pypi-dependencies]
 rerun_prompt_da = { path = ".", editable = true }
 simplecv = { git = "https://github.com/pablovela5620/simplecv.git" }
 monopriors = { git = "https://github.com/pablovela5620/monoprior.git" }
+pytorch-lightning = "*"
+gradio = "==5.33.1"
+pillow = ">=8.0,<12.0"
+torch = { version = "==2.7.0" }
+
+[tool.pixi.pypi-options]
+index-url = "https://pypi.org/simple"
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
 
 [tool.pixi.dependencies]
-python = "3.11.*"
-icecream = ">=2.1.3,<2.2"
-jaxtyping = ">=0.2.36,<0.3"
-einops = ">=0.8.0,<0.9"
-timm = ">=0.9.16,<0.10"
-pytorch-lightning = ">=2.2.2,<2.3"
-jupyterlab = ">=4.2.0,<4.3"
-numpy = "<2.0.0"
-beartype = ">=0.19,<0.20"
-transformers = ">=4.42.3,<4.43"
-rerun-sdk = ">=0.21.0,<0.22"
-pyserde = ">=0.23.0,<0.24"
-tyro = ">=0.9.1,<0.10"
-pytorch-gpu = ">=2.4.0,<3"
-xformers = ">=0.0.27,<0.0.28"
-open3d = ">=0.19.0,<0.20"
+python = "3.12.*"
+icecream = "*"
+jaxtyping = "*"
+einops = "*"
+jupyterlab = "*"
+numpy = "*"
+beartype = "*"
+transformers = "*"
+rerun-sdk = "*"
+pyserde = "*"
+tyro = "*"
+pillow = "<12.0"
+# xformers = ">=0.0.27,<0.0.28"
+open3d = "*"
+av = ">=16.0.1,<17"
+
+[tool.pixi.feature.app.pypi-dependencies]
+gradio-rerun = "==0.25.1"
 
 [tool.pixi.tasks]
 polycam-prompt_da = { cmd = "python tools/prompt_da_polycam.py --polycam-zip-path data/6G-bookcase-poly.zip", description = "Run the polycam prompt_da", depends-on = [
@@ -57,11 +67,6 @@ cmd = """
 outputs = ["data/6G-room-example.zip"]
 description = "Downloads an example polycam dataset from huggingface"
 
-[tool.pixi.feature.app.dependencies]
-gradio = "<5"
-
-[tool.pixi.feature.app.pypi-dependencies]
-gradio-rerun = { url = "https://huggingface.co/datasets/pablovela5620/gradio4-rerun-0.21/resolve/main/dist/gradio_rerun-0.0.10-py3-none-any.whl" }
 
 [tool.pixi.feature.app.tasks]
 app = { cmd = "python tools/gradio_app.py", description = "Run the gradio app", depends-on = [
