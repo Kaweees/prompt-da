@@ -1,14 +1,14 @@
 """
-Live Prompt-DA Subscriber — replaces the SLAM subscriber for comma body
-navigation.
+Live Prompt-DA Subscriber — two-thread architecture:
 
-Subscribes to camera frames over Zenoh, runs Prompt Depth Anything depth
-completion, generates traversability cost maps, publishes poses and dense
-depth, and streams everything to Rerun.
+  Mapping thread:  frames → depth → cost grid → costmap + overlay → Rerun
+  Planning thread: manages waypoints, runs A* on latest cost grid,
+                   sends path + waypoint overlays back to the mapping thread.
 
 Topics subscribed:
     body/camera/wide   — wide camera frames
     body/camera/road   — road camera frames
+    nav/waypoints      — JSON waypoint commands (add / remove / clear)
 
 Topics published:
     slam/pose          — 4x4 camera-to-world pose
@@ -22,7 +22,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import queue
+import threading
 import time
 
 import cv2
@@ -57,6 +59,55 @@ DEFAULT_COSTMAP_SIZE = 800
 DEFAULT_COSTMAP_RESOLUTION = 0.05
 DEFAULT_COSTMAP_RADIUS = 4
 
+WAYPOINT_TOPIC = "nav/waypoints"
+
+
+# ── Shared state between mapping and planning threads ─────────────────────
+
+class SharedState:
+    """Thread-safe container for data exchanged between mapping & planning."""
+
+    def __init__(self, grid_size: int, cell_res: float, cam_z_frac: float):
+        self.lock = threading.Lock()
+
+        # Written by mapping, read by planning
+        self.cost_grid: np.ndarray | None = None  # float32 [H,W] in [0,1]
+
+        # Written by planning, read by mapping
+        self.path_cells: list[tuple[int, int]] = []
+        self.waypoint_cells: list[tuple[int, int]] = []
+
+        # Grid geometry (immutable after init)
+        self.grid_size = grid_size
+        self.cell_res = cell_res
+        self.half_x = grid_size // 2
+        self.cam_z_row = int(grid_size * cam_z_frac)
+
+    # -- mapping → planning --------------------------------------------------
+    def update_cost_grid(self, cost: np.ndarray):
+        with self.lock:
+            self.cost_grid = cost.copy()
+
+    def get_cost_grid(self) -> np.ndarray | None:
+        with self.lock:
+            return self.cost_grid.copy() if self.cost_grid is not None else None
+
+    # -- planning → mapping --------------------------------------------------
+    def update_overlay(
+        self,
+        path_cells: list[tuple[int, int]],
+        wp_cells: list[tuple[int, int]],
+    ):
+        with self.lock:
+            self.path_cells = list(path_cells)
+            self.waypoint_cells = list(wp_cells)
+
+    def get_overlay(self) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        with self.lock:
+            return list(self.path_cells), list(self.waypoint_cells)
+
+
+# ── Costmap builder (pure function, no waypoints / A*) ────────────────────
 
 def build_costmap(
     depth_mm: np.ndarray,
@@ -69,27 +120,20 @@ def build_costmap(
     y_min: float = -0.5,
     y_max: float = 2.0,
     cam_z_frac: float = 0.15,
-    waypoints: list[Waypoint] | None = None,
-    obstacle_threshold: float = 0.8,
-) -> np.ndarray:
-    """Project a depth map into a bird's-eye 2D costmap on the XZ ground plane.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project depth into a BEV costmap.
 
-    Uses the camera intrinsics to back-project depth pixels into 3D, then
-    bins them onto a grid.  The camera is placed near the top of the image
-    (at *cam_z_frac* from the top) so that the forward-facing area fills
-    most of the grid.
-
-    If *waypoints* are provided, A* path planning is run between consecutive
-    waypoints and the path is drawn on the costmap.
+    Returns (grid_rgb, cost_norm) where cost_norm is float32 [0,1] for A*.
     """
     half_x = grid_size // 2
     cam_z_row = int(grid_size * cam_z_frac)
     grid = np.zeros((grid_size, grid_size, 3), dtype=np.uint8)
+    cost_norm = np.zeros((grid_size, grid_size), dtype=np.float32)
 
     h, w = depth_mm.shape[:2]
     valid = depth_mm > 0
     if not np.any(valid):
-        return grid
+        return grid, cost_norm
 
     ys_px, xs_px = np.where(valid)
     depths = depth_mm[valid].astype(np.float32) / 1000.0
@@ -115,7 +159,7 @@ def build_costmap(
     pts_world = pts_world[height_mask]
 
     if len(pts_world) == 0:
-        return grid
+        return grid, cost_norm
 
     gx = ((pts_world[:, 0] - origin_x) / cell_res + half_x).astype(np.int32)
     gz = ((pts_world[:, 2] - origin_z) / cell_res + cam_z_row).astype(np.int32)
@@ -149,35 +193,93 @@ def build_costmap(
 
     # Apply colormap: blue (far/sparse) -> red (close/dense)
     grid = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
-    # Black out empty cells
     grid[heat == 0] = 0
 
-    # Binary occupancy for A* (threshold at any nonzero density)
-    occ = (heat > 0).astype(np.uint8) * 255
+    cost_norm = heat.astype(np.float32) / 255.0
 
     cv2.circle(grid, (half_x, cam_z_row), 3, (0, 255, 0), -1)
 
-    # A* path planning from current pose through waypoints
-    if waypoints and len(waypoints) >= 1:
-        # Convert density-based heatmap to a normalized cost grid for A*
-        cost_norm = heat.astype(np.float32) / 255.0
+    return grid, cost_norm
 
-        # Current camera position is always at the grid origin marker
-        start_cell = (cam_z_row, half_x)
 
-        # Convert world waypoints to BEV grid cells
+def draw_overlay(
+    grid: np.ndarray,
+    path_cells: list[tuple[int, int]],
+    wp_cells: list[tuple[int, int]],
+):
+    """Draw path and waypoints onto a costmap image (in-place)."""
+    grid_size = grid.shape[0]
+    for r, c in path_cells:
+        if 0 <= r < grid_size and 0 <= c < grid_size:
+            cv2.circle(grid, (c, r), 2, (255, 200, 0), -1)
+    for r, c in wp_cells:
+        for dr in range(-3, 4):
+            for dc in range(-3, 4):
+                rr_, cc_ = r + dr, c + dc
+                if 0 <= rr_ < grid_size and 0 <= cc_ < grid_size:
+                    grid[rr_, cc_] = [0, 255, 255]
+
+
+# ── Planning thread ───────────────────────────────────────────────────────
+
+def planning_thread(
+    shared: SharedState,
+    session: zenoh.Session,
+    initial_waypoints: list[Waypoint],
+    obstacle_threshold: float,
+    stop_event: threading.Event,
+):
+    """Manage waypoints and run A* whenever the cost grid or waypoints change.
+
+    Listens for waypoint commands on WAYPOINT_TOPIC:
+        {"action": "add",    "x": float, "z": float, "label": str}
+        {"action": "remove", "index": int}
+        {"action": "clear"}
+    """
+    waypoints: list[Waypoint] = list(initial_waypoints)
+    wp_version = 0  # bumped on every waypoint change
+    last_planned_version = -1
+    last_cost_id = -1
+    cost_gen = 0
+
+    cmd_queue: queue.Queue = queue.Queue()
+
+    def _on_waypoint_cmd(sample):
+        try:
+            msg = json.loads(sample.payload.to_bytes().decode())
+            cmd_queue.put(msg)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+    wp_sub = session.declare_subscriber(WAYPOINT_TOPIC, _on_waypoint_cmd)
+    print(f"Planning thread: listening on '{WAYPOINT_TOPIC}' for waypoint commands")
+    if waypoints:
+        print(f"Planning thread: {len(waypoints)} initial waypoints")
+
+    def _replan():
+        nonlocal last_planned_version, last_cost_id
+        cost = shared.get_cost_grid()
+        if cost is None:
+            shared.update_overlay([], [])
+            return
+
+        start_cell = (shared.cam_z_row, shared.half_x)
+
         wp_cells: list[tuple[int, int]] = []
         for wp in waypoints:
-            gc = int((wp.x - origin_x) / cell_res + half_x)
-            gr = int((wp.z - origin_z) / cell_res + cam_z_row)
+            gc = int(wp.x / shared.cell_res + shared.half_x)
+            gr = int(wp.z / shared.cell_res + shared.cam_z_row)
             wp_cells.append((gr, gc))
 
-        # Plan A* from current pose → WP0 → WP1 → ...
+        if not wp_cells:
+            shared.update_overlay([], [])
+            return
+
         all_cells = [start_cell] + wp_cells
         full_path: list[tuple[int, int]] = []
         for i in range(len(all_cells) - 1):
             segment = astar(
-                cost_norm, all_cells[i], all_cells[i + 1],
+                cost, all_cells[i], all_cells[i + 1],
                 obstacle_threshold=obstacle_threshold,
             )
             if segment is not None:
@@ -185,21 +287,78 @@ def build_costmap(
                     segment = segment[1:]
                 full_path.extend(segment)
 
-        # Draw path as thick cyan line
-        for r, c in full_path:
-            if 0 <= r < grid_size and 0 <= c < grid_size:
-                cv2.circle(grid, (c, r), 2, (255, 200, 0), -1)
+        shared.update_overlay(full_path, wp_cells)
 
-        # Draw waypoints as yellow squares with labels
-        for idx, (r, c) in enumerate(wp_cells):
-            for dr in range(-3, 4):
-                for dc in range(-3, 4):
-                    rr_, cc_ = r + dr, c + dc
-                    if 0 <= rr_ < grid_size and 0 <= cc_ < grid_size:
-                        grid[rr_, cc_] = [0, 255, 255]
+        # Log path and waypoints to Rerun for 3D visualization
+        if full_path:
+            path_xz = np.array(
+                [((c - shared.half_x) * shared.cell_res, 0.0,
+                  (r - shared.cam_z_row) * shared.cell_res)
+                 for r, c in full_path], dtype=np.float32,
+            )
+            rr.log("world/nav/path", rr.LineStrips3D([path_xz], colors=[(255, 200, 0)]))
+        else:
+            rr.log("world/nav/path", rr.Clear(recursive=False))
 
-    return grid
+        if wp_cells:
+            wp_pts = np.array(
+                [((c - shared.half_x) * shared.cell_res, 0.0,
+                  (r - shared.cam_z_row) * shared.cell_res)
+                 for r, c in wp_cells], dtype=np.float32,
+            )
+            rr.log("world/nav/waypoints", rr.Points3D(wp_pts, radii=0.15, colors=[(0, 255, 255)]))
+        else:
+            rr.log("world/nav/waypoints", rr.Clear(recursive=False))
 
+        last_planned_version = wp_version
+        last_cost_id = cost_gen
+
+    while not stop_event.is_set():
+        # Process any pending waypoint commands
+        changed = False
+        while True:
+            try:
+                msg = cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+            action = msg.get("action", "")
+            if action == "add":
+                wp = Waypoint(
+                    x=float(msg["x"]),
+                    z=float(msg["z"]),
+                    label=msg.get("label", f"WP{len(waypoints)}"),
+                )
+                waypoints.append(wp)
+                wp_version += 1
+                changed = True
+                print(f"Planning: added {wp}")
+            elif action == "remove":
+                idx = int(msg["index"])
+                if 0 <= idx < len(waypoints):
+                    removed = waypoints.pop(idx)
+                    wp_version += 1
+                    changed = True
+                    print(f"Planning: removed {removed}")
+            elif action == "clear":
+                waypoints.clear()
+                wp_version += 1
+                changed = True
+                print("Planning: cleared all waypoints")
+
+        # Replan if waypoints changed or cost grid was updated
+        cost = shared.get_cost_grid()
+        new_cost = cost is not None
+        if changed or (new_cost and (last_planned_version != wp_version or last_cost_id != cost_gen)):
+            cost_gen += 1
+            _replan()
+
+        stop_event.wait(timeout=0.1)
+
+    wp_sub.undeclare()
+    print("Planning thread stopped")
+
+
+# ── Main (mapping thread) ────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
@@ -211,7 +370,7 @@ def main():
     parser.add_argument("--max-image-size", type=int, default=1008,
                         help="Max image size for PromptDA inference (default: 1008)")
     parser.add_argument("--max-depth-range", type=float, default=20.0,
-                        help="Maximum depth range in meters (default: 4.0)")
+                        help="Maximum depth range in meters (default: 20.0)")
     parser.add_argument("--focal", type=float, default=None,
                         help="Override focal length (default: OS04C10 intrinsics scaled to frame)")
     parser.add_argument("--connect", type=str, default=None,
@@ -231,19 +390,19 @@ def main():
     parser.add_argument("--costmap-radius", type=int, default=DEFAULT_COSTMAP_RADIUS,
                         help=f"Costmap obstacle inflation radius in cells (default: {DEFAULT_COSTMAP_RADIUS})")
     parser.add_argument("--waypoints", type=float, nargs="+", default=None,
-                        help="Navigation waypoints as x1 z1 x2 z2 ... in world meters")
+                        help="Initial waypoints as x1 z1 x2 z2 ... in world meters")
     parser.add_argument("--obstacle-threshold", type=float, default=0.8,
                         help="Cost threshold for impassable cells (default: 0.8)")
     args = parser.parse_args()
 
-    # Parse waypoints from flat list: x1 z1 x2 z2 ...
-    live_waypoints: list[Waypoint] = []
+    # Parse initial waypoints from flat list: x1 z1 x2 z2 ...
+    initial_waypoints: list[Waypoint] = []
     if args.waypoints:
         coords = args.waypoints
         if len(coords) % 2 != 0:
             parser.error("--waypoints requires pairs of x z values")
         for i in range(0, len(coords), 2):
-            live_waypoints.append(Waypoint(x=coords[i], z=coords[i + 1], label=f"WP{i // 2}"))
+            initial_waypoints.append(Waypoint(x=coords[i], z=coords[i + 1], label=f"WP{i // 2}"))
 
     # ---- Rerun setup ----
     rr.init("prompt_da_live", spawn=False)
@@ -295,9 +454,21 @@ def main():
     print(f"Publishing depth on '{DEPTH_TOPIC}'")
     print("Waiting for frames...")
 
+    # ---- Shared state & planning thread ----
+    shared = SharedState(
+        grid_size=args.costmap_size,
+        cell_res=args.costmap_resolution,
+        cam_z_frac=0.15,
+    )
+    stop_event = threading.Event()
+    planner = threading.Thread(
+        target=planning_thread,
+        args=(shared, session, initial_waypoints, args.obstacle_threshold, stop_event),
+        daemon=True,
+    )
+    planner.start()
+
     # ---- Per-camera state ----
-    # Each camera gets its own model init, intrinsics, undistortion maps,
-    # depth state, and frame counter.
     class CameraState:
         def __init__(self, name: str):
             self.name = name
@@ -315,8 +486,6 @@ def main():
             self.undistort_map2 = None
 
     cam_states: dict[str, CameraState] = {}
-
-    # Shared model (loaded once, used for all cameras)
     shared_model = None
 
     try:
@@ -326,7 +495,6 @@ def main():
             except queue.Empty:
                 continue
 
-            # Get or create per-camera state
             if cam_name not in cam_states:
                 cam_states[cam_name] = CameraState(cam_name)
             cs = cam_states[cam_name]
@@ -358,7 +526,6 @@ def main():
                     )
                 cs.model = shared_model
 
-                # Camera intrinsics scaled to frame width
                 K_fisheye = k_matrix(cs.w)
                 D = distortion_coeffs().reshape(4, 1)
 
@@ -397,12 +564,6 @@ def main():
             if run_depth:
                 rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
-                # Upscale RGB to model-optimal resolution: dimensions must be
-                # multiples of 14 (ViT patch size) and should fill max_size
-                # for best depth accuracy.  The model only adjusts dims when
-                # the image exceeds max_size, so small frames (e.g. 640x362)
-                # pass through with non-patch-aligned dims, producing badly
-                # scaled depth.
                 h_in, w_in = rgb.shape[:2]
                 _model_scale = args.max_image_size / max(h_in, w_in)
                 _model_h = int(h_in * _model_scale) // 14 * 14
@@ -424,7 +585,6 @@ def main():
                 depth_pred = cs.model(rgb=rgb_model, prompt_depth=prompt_depth)
                 depth_mm = depth_pred.depth_mm
 
-                # Resize depth back to camera resolution to match the pinhole.
                 if depth_mm.shape[:2] != (cs.h, cs.w):
                     depth_mm = cv2.resize(
                         depth_mm, (cs.w, cs.h),
@@ -453,16 +613,22 @@ def main():
             ), static=True)
             rr.log(f"world/{cam_name}/image", rr.Image(gray))
 
-            # ---- Costmap from latest depth ----
+            # ---- Costmap: build + overlay from planning thread ----
             if cs.last_depth_mm is not None:
-                costmap = build_costmap(
+                costmap, cost_norm = build_costmap(
                     cs.last_depth_mm, cs.K, cs.last_pose_wc,
                     grid_size=args.costmap_size,
                     cell_res=args.costmap_resolution,
                     inflate_radius=args.costmap_radius,
-                    waypoints=live_waypoints if live_waypoints else None,
-                    obstacle_threshold=args.obstacle_threshold,
                 )
+
+                # Push cost grid to planning thread
+                shared.update_cost_grid(cost_norm)
+
+                # Pull path + waypoints from planning thread and draw
+                path_cells, wp_cells = shared.get_overlay()
+                draw_overlay(costmap, path_cells, wp_cells)
+
                 rr.log(f"costmap/{cam_name}", rr.Image(costmap))
 
             # ---- Status ----
@@ -487,6 +653,8 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping subscriber")
     finally:
+        stop_event.set()
+        planner.join(timeout=2.0)
         for sub in frame_subs:
             sub.undeclare()
         pose_pub.undeclare()
