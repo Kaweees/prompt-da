@@ -4,7 +4,7 @@ Hardware constants for the comma device (mici variant).
 Camera intrinsics, distortion coefficients, and IMU noise parameters
 migrated from the SLAM system (mono_slam.slam).
 
-Camera: OS04C10 wide fisheye
+Camera: OS04C10 world fisheye
 IMU: BMI088
 Calibration: cv2.fisheye (KannalaBrandt8 distortion model)
 """
@@ -12,7 +12,7 @@ Calibration: cv2.fisheye (KannalaBrandt8 distortion model)
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# OS04C10 wide fisheye calibration at native 1344x760
+# OS04C10 world fisheye calibration at native 1344x760
 # ---------------------------------------------------------------------------
 NATIVE_W, NATIVE_H = 1344, 760
 NATIVE_FX, NATIVE_FY = 598.0, 598.0
@@ -36,7 +36,7 @@ IMU_DEFAULTS = {
 }
 
 # Camera-to-body (IMU) extrinsic for comma body (mici).
-# wideFromDeviceEuler ~ [0, 0, 0] => identity rotation, small translation
+# worldFromDeviceEuler ~ [0, 0, 0] => identity rotation, small translation
 # for physical offset between IMU and camera chip on PCB.
 TBC_DEFAULT = np.eye(4, dtype=np.float64)
 
@@ -44,13 +44,12 @@ TBC_DEFAULT = np.eye(4, dtype=np.float64)
 # VisionIPC stream mapping (comma device camera streams)
 # ---------------------------------------------------------------------------
 COMMA_STREAM_MAP = {
-    "road": "VISION_STREAM_ROAD",
-    "wide": "VISION_STREAM_WIDE_ROAD",
+    "world": "VISION_STREAM_WIDE_ROAD",
     "driver": "VISION_STREAM_DRIVER",
 }
 
 # Default camera stream used for navigation
-DEFAULT_CAMERA_STREAM = "wide"
+DEFAULT_CAMERA_STREAM = "world"
 
 
 def scaled_intrinsics(target_w: int) -> tuple[float, float, float, float]:

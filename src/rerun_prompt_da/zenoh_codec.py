@@ -7,8 +7,7 @@ publish poses and depth on matching topics.
 
 Topics
 ------
-body/camera/wide    — wide-angle road camera   (subscribed)
-body/camera/road    — front road camera         (subscribed)
+body/camera/wide    — wide camera               (subscribed)
 slam/imu            — IMU samples               (subscribed)
 slam/pose           — 4x4 camera-to-world pose  (published)
 slam/depth          — dense depth map            (published)
@@ -23,7 +22,6 @@ import numpy as np
 # ---------------------------------------------------------------------------
 CAMERA_TOPICS = {
     "wide": "body/camera/wide",
-    "road": "body/camera/road",
 }
 IMU_TOPIC = "slam/imu"
 POSE_TOPIC = "slam/pose"

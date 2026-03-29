@@ -7,8 +7,7 @@ Prompt Depth Anything depth completion, generates traversability cost maps,
 publishes poses and dense depth, and streams everything to Rerun.
 
 Topics subscribed:
-    body/camera/wide   — wide-angle road camera frames
-    body/camera/road   — front road camera frames
+    body/camera/wide   — wide camera frames
     slam/imu           — IMU samples (optional)
 
 Topics published:
@@ -54,41 +53,50 @@ from rerun_prompt_da.zenoh_codec import (
     encode_depth,
 )
 
-# Costmap parameters (same as SLAM system for compatibility)
-COSTMAP_SIZE = 200         # grid cells per side
-COSTMAP_RESOLUTION = 0.05  # meters per cell (5 cm)
-COSTMAP_RADIUS = 3         # inflation radius in cells
-COSTMAP_HALF = COSTMAP_SIZE // 2
-COSTMAP_Y_MIN = -0.5
-COSTMAP_Y_MAX = 2.0
+# Costmap defaults
+DEFAULT_COSTMAP_SIZE = 400
+DEFAULT_COSTMAP_RESOLUTION = 0.025
+DEFAULT_COSTMAP_RADIUS = 6
 
 
-def build_costmap(depth_mm: np.ndarray, K: np.ndarray,
-                  pose_wc: np.ndarray | None = None) -> np.ndarray:
+def build_costmap(
+    depth_mm: np.ndarray,
+    K: np.ndarray,
+    pose_wc: np.ndarray | None = None,
+    *,
+    grid_size: int = DEFAULT_COSTMAP_SIZE,
+    cell_res: float = DEFAULT_COSTMAP_RESOLUTION,
+    inflate_radius: int = DEFAULT_COSTMAP_RADIUS,
+    y_min: float = -0.5,
+    y_max: float = 2.0,
+    cam_z_frac: float = 0.15,
+) -> np.ndarray:
     """Project a depth map into a bird's-eye 2D costmap on the XZ ground plane.
 
     Uses the camera intrinsics to back-project depth pixels into 3D, then
-    bins them onto a grid centered on the camera position.
+    bins them onto a grid.  The camera is placed near the top of the image
+    (at *cam_z_frac* from the top) so that the forward-facing area fills
+    most of the grid.
     """
-    grid = np.zeros((COSTMAP_SIZE, COSTMAP_SIZE, 3), dtype=np.uint8)
+    half_x = grid_size // 2
+    cam_z_row = int(grid_size * cam_z_frac)
+    grid = np.zeros((grid_size, grid_size, 3), dtype=np.uint8)
 
     h, w = depth_mm.shape[:2]
     valid = depth_mm > 0
     if not np.any(valid):
         return grid
 
-    # Back-project valid depth pixels to 3D camera-frame points
     ys_px, xs_px = np.where(valid)
-    depths = depth_mm[valid].astype(np.float32) / 1000.0  # mm -> meters
+    depths = depth_mm[valid].astype(np.float32) / 1000.0
 
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
     x3d = (xs_px - cx) * depths / fx
     y3d = (ys_px - cy) * depths / fy
     z3d = depths
-    pts_cam = np.stack([x3d, y3d, z3d], axis=-1)  # (N, 3)
+    pts_cam = np.stack([x3d, y3d, z3d], axis=-1)
 
-    # Transform to world frame if pose available
     if pose_wc is not None:
         R_wc = pose_wc[:3, :3]
         t_wc = pose_wc[:3, 3]
@@ -98,51 +106,32 @@ def build_costmap(depth_mm: np.ndarray, K: np.ndarray,
         pts_world = pts_cam
         origin_x, origin_z = 0.0, 0.0
 
-    # Height filter
     y_rel = pts_world[:, 1] - (pose_wc[1, 3] if pose_wc is not None else 0.0)
-    height_mask = (y_rel >= COSTMAP_Y_MIN) & (y_rel <= COSTMAP_Y_MAX)
+    height_mask = (y_rel >= y_min) & (y_rel <= y_max)
     pts_world = pts_world[height_mask]
 
     if len(pts_world) == 0:
         return grid
 
-    gx = ((pts_world[:, 0] - origin_x) / COSTMAP_RESOLUTION + COSTMAP_HALF).astype(np.int32)
-    gz = ((pts_world[:, 2] - origin_z) / COSTMAP_RESOLUTION + COSTMAP_HALF).astype(np.int32)
+    gx = ((pts_world[:, 0] - origin_x) / cell_res + half_x).astype(np.int32)
+    gz = ((pts_world[:, 2] - origin_z) / cell_res + cam_z_row).astype(np.int32)
 
-    mask = (gx >= 0) & (gx < COSTMAP_SIZE) & (gz >= 0) & (gz < COSTMAP_SIZE)
+    mask = (gx >= 0) & (gx < grid_size) & (gz >= 0) & (gz < grid_size)
     gx, gz = gx[mask], gz[mask]
 
-    occ = np.zeros((COSTMAP_SIZE, COSTMAP_SIZE), dtype=np.uint8)
+    occ = np.zeros((grid_size, grid_size), dtype=np.uint8)
     occ[gz, gx] = 255
-    if COSTMAP_RADIUS > 0:
+    if inflate_radius > 0:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (2 * COSTMAP_RADIUS + 1, 2 * COSTMAP_RADIUS + 1),
+            (2 * inflate_radius + 1, 2 * inflate_radius + 1),
         )
         occ = cv2.dilate(occ, kernel)
 
-    grid[:, :, 0] = occ  # red = obstacle
-    cv2.circle(grid, (COSTMAP_HALF, COSTMAP_HALF), 3, (0, 255, 0), -1)
+    grid[:, :, 0] = occ
+    cv2.circle(grid, (half_x, cam_z_row), 3, (0, 255, 0), -1)
 
     return grid
-
-
-def log_costmap(
-    entity_path: str,
-    costmap: np.ndarray,
-    *,
-    origin_x: float,
-    origin_z: float,
-    cell_size: float,
-) -> None:
-    rr.log(
-        entity_path,
-        rr.Transform3D(
-            translation=[origin_x, 0.0, origin_z],
-            scale=[cell_size, cell_size, 1.0],
-        ),
-        rr.Image(costmap),
-    )
 
 
 def main():
@@ -170,6 +159,12 @@ def main():
                         help="Host for rerun+http:// URI (default: 127.0.0.1)")
     parser.add_argument("--drop-nonmonotonic", action="store_true",
                         help="Drop frames whose timestamps go backwards or repeat")
+    parser.add_argument("--costmap-size", type=int, default=DEFAULT_COSTMAP_SIZE,
+                        help=f"Costmap grid cells per side (default: {DEFAULT_COSTMAP_SIZE})")
+    parser.add_argument("--costmap-resolution", type=float, default=DEFAULT_COSTMAP_RESOLUTION,
+                        help=f"Costmap cell size in meters (default: {DEFAULT_COSTMAP_RESOLUTION})")
+    parser.add_argument("--costmap-radius", type=int, default=DEFAULT_COSTMAP_RADIUS,
+                        help=f"Costmap obstacle inflation radius in cells (default: {DEFAULT_COSTMAP_RADIUS})")
     args = parser.parse_args()
 
     # ---- Rerun setup ----
@@ -188,8 +183,7 @@ def main():
                 rrb.Vertical(
                     rrb.Spatial2DView(origin="world/wide/image"),
                     rrb.Spatial2DView(origin="world/wide/depth"),
-                    rrb.Spatial2DView(origin="world/road/image"),
-                    rrb.Spatial2DView(origin="world/road/depth"),
+                    rrb.Spatial2DView(origin="costmap/wide"),
                 ),
                 column_shares=[20, 9],
             ),
@@ -379,28 +373,32 @@ def main():
 
             # ---- Costmap from latest depth ----
             if cs.last_depth_mm is not None:
-                costmap = build_costmap(cs.last_depth_mm, cs.K, cs.last_pose_wc)
-                if cs.last_pose_wc is not None:
-                    costmap_origin_x = float(cs.last_pose_wc[0, 3]) - COSTMAP_HALF * COSTMAP_RESOLUTION
-                    costmap_origin_z = float(cs.last_pose_wc[2, 3]) - COSTMAP_HALF * COSTMAP_RESOLUTION
-                else:
-                    costmap_origin_x = -COSTMAP_HALF * COSTMAP_RESOLUTION
-                    costmap_origin_z = -COSTMAP_HALF * COSTMAP_RESOLUTION
-                log_costmap(
-                    f"costmap/{cam_name}",
-                    costmap,
-                    origin_x=costmap_origin_x,
-                    origin_z=costmap_origin_z,
-                    cell_size=COSTMAP_RESOLUTION,
+                costmap = build_costmap(
+                    cs.last_depth_mm, cs.K, cs.last_pose_wc,
+                    grid_size=args.costmap_size,
+                    cell_res=args.costmap_resolution,
+                    inflate_radius=args.costmap_radius,
                 )
+                rr.log(f"costmap/{cam_name}", rr.Image(costmap))
 
             # ---- Status ----
             if cs.frame_count % 30 == 0:
-                has_depth = "+" if cs.last_depth_mm is not None else "-"
-                print(
-                    f"[{cam_name}:{cs.frame_count}] depth={has_depth} "
-                    f"imu_samples={'n/a' if imu_samples is None else len(imu_samples)}"
-                )
+                if cs.last_depth_mm is not None:
+                    valid_mask = cs.last_depth_mm > 0
+                    n_valid = int(np.count_nonzero(valid_mask))
+                    if n_valid > 0:
+                        valid_vals = cs.last_depth_mm[valid_mask].astype(np.float32)
+                        d_min = float(valid_vals.min()) / 1000.0
+                        d_max = float(valid_vals.max()) / 1000.0
+                        d_mean = float(valid_vals.mean()) / 1000.0
+                    else:
+                        d_min = d_max = d_mean = 0.0
+                    print(
+                        f"[{cam_name}:{cs.frame_count}] "
+                        f"depth: {n_valid}px min={d_min:.2f}m max={d_max:.2f}m mean={d_mean:.2f}m"
+                    )
+                else:
+                    print(f"[{cam_name}:{cs.frame_count}] depth: none")
 
     except KeyboardInterrupt:
         print("\nStopping subscriber")
