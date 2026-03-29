@@ -38,6 +38,11 @@ from rerun_prompt_da.hardware import (
     k_matrix,
     distortion_coeffs,
 )
+from rerun_prompt_da.path_planning import (
+    Waypoint,
+    astar,
+    path_to_world_coords,
+)
 from rerun_prompt_da.zenoh_codec import (
     CAMERA_TOPICS,
     POSE_TOPIC,
@@ -64,6 +69,8 @@ def build_costmap(
     y_min: float = -0.5,
     y_max: float = 2.0,
     cam_z_frac: float = 0.15,
+    waypoints: list[Waypoint] | None = None,
+    obstacle_threshold: float = 0.8,
 ) -> np.ndarray:
     """Project a depth map into a bird's-eye 2D costmap on the XZ ground plane.
 
@@ -71,6 +78,9 @@ def build_costmap(
     bins them onto a grid.  The camera is placed near the top of the image
     (at *cam_z_frac* from the top) so that the forward-facing area fills
     most of the grid.
+
+    If *waypoints* are provided, A* path planning is run between consecutive
+    waypoints and the path is drawn on the costmap.
     """
     half_x = grid_size // 2
     cam_z_row = int(grid_size * cam_z_frac)
@@ -125,6 +135,43 @@ def build_costmap(
     grid[:, :, 0] = occ
     cv2.circle(grid, (half_x, cam_z_row), 3, (0, 255, 0), -1)
 
+    # A* path planning through waypoints on the BEV grid
+    if waypoints and len(waypoints) >= 2:
+        # Convert occupancy to a normalized cost grid for A*
+        cost_norm = occ.astype(np.float32) / 255.0
+
+        # Convert world waypoints to BEV grid cells
+        wp_cells: list[tuple[int, int]] = []
+        for wp in waypoints:
+            gc = int((wp.x - origin_x) / cell_res + half_x)
+            gr = int((wp.z - origin_z) / cell_res + cam_z_row)
+            wp_cells.append((gr, gc))
+
+        # Plan A* between consecutive waypoint pairs
+        full_path: list[tuple[int, int]] = []
+        for i in range(len(wp_cells) - 1):
+            segment = astar(
+                cost_norm, wp_cells[i], wp_cells[i + 1],
+                obstacle_threshold=obstacle_threshold,
+            )
+            if segment is not None:
+                if full_path:
+                    segment = segment[1:]
+                full_path.extend(segment)
+
+        # Draw path in blue
+        for r, c in full_path:
+            if 0 <= r < grid_size and 0 <= c < grid_size:
+                grid[r, c] = [0, 100, 255]
+
+        # Draw waypoints as yellow squares
+        for r, c in wp_cells:
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    rr_, cc_ = r + dr, c + dc
+                    if 0 <= rr_ < grid_size and 0 <= cc_ < grid_size:
+                        grid[rr_, cc_] = [255, 255, 0]
+
     return grid
 
 
@@ -157,7 +204,20 @@ def main():
                         help=f"Costmap cell size in meters (default: {DEFAULT_COSTMAP_RESOLUTION})")
     parser.add_argument("--costmap-radius", type=int, default=DEFAULT_COSTMAP_RADIUS,
                         help=f"Costmap obstacle inflation radius in cells (default: {DEFAULT_COSTMAP_RADIUS})")
+    parser.add_argument("--waypoints", type=float, nargs="+", default=None,
+                        help="Navigation waypoints as x1 z1 x2 z2 ... in world meters")
+    parser.add_argument("--obstacle-threshold", type=float, default=0.8,
+                        help="Cost threshold for impassable cells (default: 0.8)")
     args = parser.parse_args()
+
+    # Parse waypoints from flat list: x1 z1 x2 z2 ...
+    live_waypoints: list[Waypoint] = []
+    if args.waypoints:
+        coords = args.waypoints
+        if len(coords) % 2 != 0:
+            parser.error("--waypoints requires pairs of x z values")
+        for i in range(0, len(coords), 2):
+            live_waypoints.append(Waypoint(x=coords[i], z=coords[i + 1], label=f"WP{i // 2}"))
 
     # ---- Rerun setup ----
     rr.init("prompt_da_live", spawn=False)
@@ -331,9 +391,9 @@ def main():
                 if cs.last_depth_mm is not None:
                     prompt_depth = cv2.resize(cs.last_depth_mm, (PROMPT_W, PROMPT_H), interpolation=cv2.INTER_NEAREST)
                 else:
-                    prompt_depth = np.linspace(
-                        500, 4000, PROMPT_H * PROMPT_W, dtype=np.float32
-                    ).reshape(PROMPT_H, PROMPT_W).astype(np.uint16)
+                    prompt_depth = np.full((PROMPT_H, PROMPT_W), 2000, dtype=np.uint16)
+                    prompt_depth[0, 0] = 500
+                    prompt_depth[-1, -1] = 4000
 
                 depth_pred = cs.model(rgb=rgb_model, prompt_depth=prompt_depth)
                 depth_mm = depth_pred.depth_mm
@@ -374,6 +434,8 @@ def main():
                     grid_size=args.costmap_size,
                     cell_res=args.costmap_resolution,
                     inflate_radius=args.costmap_radius,
+                    waypoints=live_waypoints if live_waypoints else None,
+                    obstacle_threshold=args.obstacle_threshold,
                 )
                 rr.log(f"costmap/{cam_name}", rr.Image(costmap))
 

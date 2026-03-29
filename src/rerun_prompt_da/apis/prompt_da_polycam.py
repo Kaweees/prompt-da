@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -23,6 +23,13 @@ from simplecv.ops.tsdf_depth_fuser import Open3DFuser
 from simplecv.rerun_log_utils import RerunTyroConfig, log_pinhole
 from tqdm import tqdm
 
+from rerun_prompt_da.path_planning import (
+    Waypoint,
+    plan_waypoint_route,
+    path_to_world_coords,
+    world_to_grid,
+)
+
 
 @dataclass
 class PDAPolycamConfig:
@@ -38,6 +45,10 @@ class PDAPolycamConfig:
     """Maximum traversable height difference (meters) within a cell before it becomes an obstacle."""
     robot_height: float = 0.5
     """Vertical clearance required by the robot (meters). Cells with height range exceeding this are obstacles."""
+    obstacle_threshold: float = 0.8
+    """Cost value at or above which a cell is considered impassable for path planning."""
+    waypoints: list[list[float]] = field(default_factory=list)
+    """Ordered navigation waypoints as [[x1, z1], [x2, z2], ...] in world coords (meters)."""
 
 
 def log_polycam_data(
@@ -181,6 +192,33 @@ def filter_depth(
     return filtered_depth_mm
 
 
+def render_cost_map_with_path(
+    cost_grid: np.ndarray,
+    path: list[tuple[int, int]],
+    waypoint_cells: list[tuple[int, int]],
+) -> np.ndarray:
+    """Render cost grid as RGB with path (blue) and waypoints (yellow) overlaid."""
+    ch, cw = cost_grid.shape
+    cost_rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
+    cost_rgb[:, :, 0] = (cost_grid * 255).astype(np.uint8)
+    cost_rgb[:, :, 1] = ((1 - cost_grid) * 255).astype(np.uint8)
+
+    # Draw path in blue
+    for r, c in path:
+        if 0 <= r < ch and 0 <= c < cw:
+            cost_rgb[r, c] = [0, 100, 255]
+
+    # Draw waypoints as 3x3 yellow squares
+    for r, c in waypoint_cells:
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                rr_, cc_ = r + dr, c + dc
+                if 0 <= rr_ < ch and 0 <= cc_ < cw:
+                    cost_rgb[rr_, cc_] = [255, 255, 0]
+
+    return cost_rgb
+
+
 def create_blueprint(parent_log_path: Path) -> rrb.Blueprint:
     blueprint = rrb.Blueprint(
         rrb.Horizontal(
@@ -196,6 +234,52 @@ def create_blueprint(parent_log_path: Path) -> rrb.Blueprint:
     return blueprint
 
 
+def _log_cost_map_and_path(
+    parent_log_path: Path,
+    cost_grid: np.ndarray,
+    origin_x: float,
+    origin_z: float,
+    config: PDAPolycamConfig,
+    waypoints: list[Waypoint],
+) -> None:
+    """Compute A* path through waypoints and log cost map + path to Rerun."""
+    path, waypoint_cells = plan_waypoint_route(
+        cost_grid,
+        waypoints,
+        origin_x,
+        origin_z,
+        config.cost_map_resolution,
+        obstacle_threshold=config.obstacle_threshold,
+    )
+
+    cost_rgb = render_cost_map_with_path(cost_grid, path, waypoint_cells)
+    rr.log(f"{parent_log_path}/cost_map", rr.Image(cost_rgb))
+
+    # Log waypoints as 3D points on the ground plane (Y=0)
+    if waypoints:
+        wp_positions = np.array(
+            [[wp.x, 0.0, wp.z] for wp in waypoints], dtype=np.float32
+        )
+        wp_labels = [wp.label or f"WP{i}" for i, wp in enumerate(waypoints)]
+        rr.log(
+            f"{parent_log_path}/waypoints",
+            rr.Points3D(wp_positions, labels=wp_labels, radii=0.05),
+        )
+
+    # Log planned path as 3D line strip (Y=0)
+    if path:
+        world_coords = path_to_world_coords(
+            path, origin_x, origin_z, config.cost_map_resolution
+        )
+        path_3d = np.zeros((len(world_coords), 3), dtype=np.float32)
+        path_3d[:, 0] = world_coords[:, 0]  # X
+        path_3d[:, 2] = world_coords[:, 1]  # Z
+        rr.log(
+            f"{parent_log_path}/planned_path",
+            rr.LineStrips3D([path_3d], radii=0.02),
+        )
+
+
 def pda_polycam_inference(
     config: PDAPolycamConfig,
 ) -> None:
@@ -206,6 +290,12 @@ def pda_polycam_inference(
     rr.send_blueprint(blueprint=blueprint)
     polycam_zip_path: Path = config.polycam_zip_path
     polycam_dataset: PolycamDataset = load_polycam_data(polycam_zip_or_directory_path=polycam_zip_path)
+
+    # Parse waypoints from config
+    waypoints = [
+        Waypoint(x=pt[0], z=pt[1], label=f"WP{i}")
+        for i, pt in enumerate(config.waypoints)
+    ]
 
     pred_fuser = Open3DFuser(
         fusion_resolution=config.depth_fusion_resolution,
@@ -259,18 +349,16 @@ def pda_polycam_inference(
                 ),
             )
 
-            # Update cost map from current mesh state
+            # Update cost map and path plan from current mesh state
             cost_grid, _height_grid, origin_x, origin_z = compute_cost_map_from_mesh(
                 mesh=pred_mesh,
                 cell_size=config.cost_map_resolution,
                 max_step_height=config.max_step_height,
                 robot_height=config.robot_height,
             )
-            ch, cw = cost_grid.shape
-            cost_rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
-            cost_rgb[:, :, 0] = (cost_grid * 255).astype(np.uint8)
-            cost_rgb[:, :, 1] = ((1 - cost_grid) * 255).astype(np.uint8)
-            rr.log(f"{parent_log_path}/cost_map", rr.Image(cost_rgb))
+            _log_cost_map_and_path(
+                parent_log_path, cost_grid, origin_x, origin_z, config, waypoints
+            )
 
     # Final mesh and cost map
     pred_mesh = pred_fuser.get_mesh()
@@ -292,16 +380,18 @@ def pda_polycam_inference(
         max_step_height=config.max_step_height,
         robot_height=config.robot_height,
     )
+    _log_cost_map_and_path(
+        parent_log_path, cost_grid, origin_x, origin_z, config, waypoints
+    )
+
     ch, cw = cost_grid.shape
-    cost_rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
-    cost_rgb[:, :, 0] = (cost_grid * 255).astype(np.uint8)
-    cost_rgb[:, :, 1] = ((1 - cost_grid) * 255).astype(np.uint8)
-    rr.log(f"{parent_log_path}/cost_map", rr.Image(cost_rgb))
     rr.log(
         f"{parent_log_path}/cost_map/metadata",
         rr.TextLog(
             f"origin=({origin_x:.2f}, {origin_z:.2f}) "
             f"cell_size={config.cost_map_resolution}m "
-            f"grid={cw}x{ch} cells"
+            f"grid={cw}x{ch} cells "
+            f"waypoints={len(waypoints)} "
+            f"obstacle_threshold={config.obstacle_threshold}"
         ),
     )
