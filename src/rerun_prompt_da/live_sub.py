@@ -340,17 +340,32 @@ def main():
             if run_depth:
                 rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
+                # Upscale RGB to model-optimal resolution: dimensions must be
+                # multiples of 14 (ViT patch size) and should fill max_size
+                # for best depth accuracy.  The model only adjusts dims when
+                # the image exceeds max_size, so small frames (e.g. 640x362)
+                # pass through with non-patch-aligned dims, producing badly
+                # scaled depth.
+                h_in, w_in = rgb.shape[:2]
+                _model_scale = args.max_image_size / max(h_in, w_in)
+                _model_h = int(h_in * _model_scale) // 14 * 14
+                _model_w = int(w_in * _model_scale) // 14 * 14
+                if (_model_w, _model_h) != (w_in, h_in):
+                    rgb_model = cv2.resize(rgb, (_model_w, _model_h),
+                                           interpolation=cv2.INTER_LINEAR)
+                else:
+                    rgb_model = rgb
+
                 PROMPT_H, PROMPT_W = 192, 256
                 if cs.last_depth_mm is not None:
                     prompt_depth = cv2.resize(cs.last_depth_mm, (PROMPT_W, PROMPT_H), interpolation=cv2.INTER_NEAREST)
                 else:
                     prompt_depth = np.zeros((PROMPT_H, PROMPT_W), dtype=np.uint16)
 
-                depth_pred = cs.model(rgb=rgb, prompt_depth=prompt_depth)
+                depth_pred = cs.model(rgb=rgb_model, prompt_depth=prompt_depth)
                 depth_mm = depth_pred.depth_mm
 
-                # Resize depth to match camera resolution so the Rerun point
-                # cloud aligns with the pinhole intrinsics.
+                # Resize depth back to camera resolution to match the pinhole.
                 if depth_mm.shape[:2] != (cs.h, cs.w):
                     depth_mm = cv2.resize(
                         depth_mm, (cs.w, cs.h),
