@@ -1,10 +1,11 @@
 """
-Live Prompt-DA Subscriber — replaces the SLAM subscriber for comma body
+Live Depth Subscriber — replaces the SLAM subscriber for comma body
 navigation.
 
 Subscribes to camera frames (and optionally IMU data) over Zenoh, runs
-Prompt Depth Anything depth completion, generates traversability cost maps,
-publishes poses and dense depth, and streams everything to Rerun.
+monocular metric depth estimation (UniDepth V2 by default), generates
+traversability cost maps, publishes poses and dense depth, and streams
+everything to Rerun.
 
 Topics subscribed:
     body/camera/wide   — wide camera frames
@@ -15,7 +16,8 @@ Topics published:
     slam/depth         — dense uint16 depth map (mm)
 
 Usage:
-    uv run prompt-da-sub                          # depth only, Rerun on :9090
+    uv run prompt-da-sub                          # UniDepth V2, Rerun on :9090
+    uv run prompt-da-sub --depth-model promptda   # use Prompt-DA instead
     uv run prompt-da-sub --imu                    # with IMU data
     uv run prompt-da-sub --depth-every 3          # run depth every 3rd frame
 """
@@ -137,10 +139,15 @@ def build_costmap(
 def main():
     parser = argparse.ArgumentParser(
         description="Prompt-DA live subscriber (Zenoh + Rerun)")
-    parser.add_argument("--depth-model", default="large", choices=["large"],
-                        help="Prompt-DA model size (default: large)")
+    parser.add_argument("--depth-model", default="unidepth",
+                        choices=["unidepth", "promptda"],
+                        help="Depth model: unidepth (UniDepth V2, metric) or "
+                             "promptda (Prompt-DA, depth completion) (default: unidepth)")
+    parser.add_argument("--unidepth-backbone", default="vitl14",
+                        choices=["vits14", "vitl14"],
+                        help="UniDepth backbone (default: vitl14)")
     parser.add_argument("--depth-every", type=int, default=5,
-                        help="Run depth completion every N frames (default: 5)")
+                        help="Run depth estimation every N frames (default: 5)")
     parser.add_argument("--max-image-size", type=int, default=1008,
                         help="Max image size for PromptDA inference (default: 1008)")
     parser.add_argument("--max-depth-range", type=float, default=4.0,
@@ -292,13 +299,22 @@ def main():
                 print(f"[{cam_name}] First frame: {cs.w}x{cs.h}, initializing...")
 
                 if shared_model is None:
-                    print(f"Loading Prompt-DA ({args.depth_model})...")
-                    from monopriors.depth_completion_models.prompt_da import PromptDAPredictor
-                    shared_model = PromptDAPredictor(
-                        device="cuda",
-                        model_type=args.depth_model,
-                        max_size=args.max_image_size,
-                    )
+                    if args.depth_model == "unidepth":
+                        print(f"Loading UniDepth V2 ({args.unidepth_backbone})...")
+                        from monopriors.metric_depth_models.unidepth import UniDepthMetricPredictor
+                        shared_model = UniDepthMetricPredictor(
+                            device="cuda",
+                            version="v2",
+                            backbone=args.unidepth_backbone,
+                        )
+                    else:
+                        print(f"Loading Prompt-DA (large)...")
+                        from monopriors.depth_completion_models.prompt_da import PromptDAPredictor
+                        shared_model = PromptDAPredictor(
+                            device="cuda",
+                            model_type="large",
+                            max_size=args.max_image_size,
+                        )
                 cs.model = shared_model
 
                 # Camera intrinsics scaled to frame width
@@ -340,32 +356,25 @@ def main():
             if run_depth:
                 rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
-                # Upscale RGB to model-optimal resolution: dimensions must be
-                # multiples of 14 (ViT patch size) and should fill max_size
-                # for best depth accuracy.  The model only adjusts dims when
-                # the image exceeds max_size, so small frames (e.g. 640x362)
-                # pass through with non-patch-aligned dims, producing badly
-                # scaled depth.
-                h_in, w_in = rgb.shape[:2]
-                _model_scale = args.max_image_size / max(h_in, w_in)
-                _model_h = int(h_in * _model_scale) // 14 * 14
-                _model_w = int(w_in * _model_scale) // 14 * 14
-                if (_model_w, _model_h) != (w_in, h_in):
-                    rgb_model = cv2.resize(rgb, (_model_w, _model_h),
-                                           interpolation=cv2.INTER_LINEAR)
+                if args.depth_model == "unidepth":
+                    # UniDepth V2: metric monocular depth with intrinsics
+                    depth_pred = cs.model(rgb=rgb, K_33=cs.K)
+                    depth_meters = depth_pred.depth_meters
+                    # Clamp negatives/NaN, then convert to uint16 mm
+                    depth_meters = np.nan_to_num(depth_meters, nan=0.0, posinf=0.0, neginf=0.0)
+                    depth_meters[depth_meters < 0] = 0.0
+                    depth_mm = (depth_meters * 1000).astype(np.uint16)
                 else:
-                    rgb_model = rgb
+                    # Prompt-DA: depth completion with prompt feedback
+                    PROMPT_H, PROMPT_W = 192, 256
+                    if cs.last_depth_mm is not None:
+                        prompt_depth = cv2.resize(cs.last_depth_mm, (PROMPT_W, PROMPT_H), interpolation=cv2.INTER_NEAREST)
+                    else:
+                        prompt_depth = np.zeros((PROMPT_H, PROMPT_W), dtype=np.uint16)
+                    depth_pred = cs.model(rgb=rgb, prompt_depth=prompt_depth)
+                    depth_mm = depth_pred.depth_mm
 
-                PROMPT_H, PROMPT_W = 192, 256
-                if cs.last_depth_mm is not None:
-                    prompt_depth = cv2.resize(cs.last_depth_mm, (PROMPT_W, PROMPT_H), interpolation=cv2.INTER_NEAREST)
-                else:
-                    prompt_depth = np.zeros((PROMPT_H, PROMPT_W), dtype=np.uint16)
-
-                depth_pred = cs.model(rgb=rgb_model, prompt_depth=prompt_depth)
-                depth_mm = depth_pred.depth_mm
-
-                # Resize depth back to camera resolution to match the pinhole.
+                # Resize depth to camera resolution if needed.
                 if depth_mm.shape[:2] != (cs.h, cs.w):
                     depth_mm = cv2.resize(
                         depth_mm, (cs.w, cs.h),
