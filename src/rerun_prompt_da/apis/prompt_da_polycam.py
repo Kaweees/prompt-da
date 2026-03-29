@@ -3,6 +3,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import open3d as o3d
 import rerun as rr
 import rerun.blueprint as rrb
 from jaxtyping import UInt8, UInt16
@@ -88,8 +89,8 @@ def create_blueprint(parent_log_path: Path) -> rrb.Blueprint:
         rrb.Horizontal(
             rrb.Spatial3DView(),
             rrb.Vertical(
-                rrb.Spatial2DView(origin=parent_log_path / "cam" / "pinhole" / "arkit_depth"),
                 rrb.Spatial2DView(origin=parent_log_path / "cam" / "pinhole" / "pred_depth"),
+                rrb.Spatial2DView(origin=f"{parent_log_path}/cost_map"),
             ),
             column_shares=[20, 9],
         ),
@@ -118,7 +119,7 @@ def pda_polycam_inference(
     pbar = tqdm(polycam_dataset, desc="Inferring", total=len(polycam_dataset))
     polycam_data: PolycamData
     for frame_idx, polycam_data in enumerate(pbar):
-        rr.set_time_sequence("frame_idx", frame_idx)
+        rr.set_time("frame_idx", sequence=frame_idx)
         # convert image data to tensor
         depth_pred: CompletionDepthPrediction = model(
             rgb=polycam_data.rgb_hw3, prompt_depth=polycam_data.original_depth_hw

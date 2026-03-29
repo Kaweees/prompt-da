@@ -173,8 +173,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# pixi environments
-.pixi
+# uv
+.venv/
+uv.lock
 *.egg-info
 
 data

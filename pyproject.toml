@@ -1,103 +1,56 @@
 [project]
 authors = [{ name = "pablovela5620", email = "pablovela5620@gmail.com" }]
-dependencies = []
 description = "Add a short description here"
 name = "rerun-prompt-da"
 requires-python = ">= 3.12"
 version = "0.1.0"
+dependencies = [
+    "numpy",
+    "av>=16.0.1,<17",
+    "transformers",
+    "rerun-sdk",
+    "jaxtyping",
+    "einops",
+    "beartype",
+    "pyserde",
+    "tyro",
+    "icecream",
+    "pillow>=8.0,<12.0",
+    "torch>=2.7.0",
+    "pytorch-lightning",
+    "opencv-python",
+    "tqdm",
+    "simplecv",
+    "monopriors",
+    "eclipse-zenoh>=1.8.0",
+    "open3d ; platform_machine != 'aarch64'",
+    "open3d-unofficial-arm ; platform_machine == 'aarch64'",
+]
+
+[project.scripts]
+polycam-prompt-da = "rerun_prompt_da.cli:main"
 
 [build-system]
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
-[tool.pixi.workspace]
-channels = ["conda-forge"]
-platforms = ["linux-64"]
-
-[tool.pixi.system-requirements]
-cuda = "12.8"
-
-[tool.pixi.pypi-dependencies]
-rerun_prompt_da = { path = ".", editable = true }
+[tool.uv.sources]
 simplecv = { git = "https://github.com/pablovela5620/simplecv.git" }
 monopriors = { git = "https://github.com/pablovela5620/monoprior.git" }
-pytorch-lightning = "*"
-gradio = "==5.33.1"
-pillow = ">=8.0,<12.0"
-torch = { version = "==2.7.0" }
+torch = { index = "pytorch-cu130" }
+onnxruntime-gpu = { index = "jetson-ai-lab" }
 
-[tool.pixi.pypi-options]
-index-url = "https://pypi.org/simple"
-extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
-
-[tool.pixi.dependencies]
-python = "3.12.*"
-icecream = "*"
-jaxtyping = "*"
-einops = "*"
-jupyterlab = "*"
-numpy = "*"
-beartype = "*"
-transformers = "*"
-rerun-sdk = "*"
-pyserde = "*"
-tyro = "*"
-pillow = "<12.0"
-# xformers = ">=0.0.27,<0.0.28"
-open3d = "*"
-av = ">=16.0.1,<17"
-
-[tool.pixi.feature.app.pypi-dependencies]
-gradio-rerun = "==0.25.1"
-
-[tool.pixi.tasks]
-polycam-prompt_da = { cmd = "python tools/prompt_da_polycam.py --polycam-zip-path data/6G-room-example.zip", description = "Run the polycam prompt_da", depends-on = [
-    "_download-example",
-] }
-
-[tool.pixi.tasks._download-example]
-cmd = """
-    test -e data/6G-room-example.zip
-    || (
-        huggingface-cli download pablovela5620/polycam-example-data \
-        6G-room-example.zip --repo-type dataset \
-        --local-dir data/
-    )
-    """
-outputs = ["data/6G-room-example.zip"]
-description = "Downloads an example polycam dataset from huggingface"
-
-
-[tool.pixi.feature.app.tasks]
-app = { cmd = "python tools/gradio_app.py", description = "Run the gradio app", depends-on = [
-    "_download-example",
-] }
-dev-app = { cmd = "gradio tools/gradio_app.py", description = "Run the gradio app in dev mode", depends-on = [
-    "_download-example",
-] }
-
-[tool.pixi.environments]
-app = { features = ["app"], solve-group = "default" }
-
-[tool.ruff]
-line-length = 120
-select = [
-    # pycodestyle
-    "E",
-    # Pyflakes
-    "F",
-    # pyupgrade
-    "UP",
-    # flake8-bugbear
-    "B",
-    # flake8-simplify
-    "SIM",
-    # isort
-    "I",
+[tool.uv]
+override-dependencies = [
+  "onnxruntime-gpu ; platform_machine != 'aarch64'",
 ]
 
-ignore = [
-    "E501", # Line too long.
-    "F722", # Forward annotation false positive from jaxtyping. Should be caught by pyright.
-    "F821", # Forward annotation false positive from jaxtyping. Should be caught by pyright.
-]
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "jetson-ai-lab"
+url = "https://pypi.jetson-ai-lab.io/sbsa/cu130"
+explicit = true
