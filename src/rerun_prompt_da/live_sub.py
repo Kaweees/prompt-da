@@ -52,10 +52,10 @@ from rerun_prompt_da.zenoh_codec import (
     encode_depth,
 )
 
-# Costmap defaults
-DEFAULT_COSTMAP_SIZE = 400
-DEFAULT_COSTMAP_RESOLUTION = 0.025
-DEFAULT_COSTMAP_RADIUS = 6
+# Costmap defaults — sized to cover the full depth range (20m)
+DEFAULT_COSTMAP_SIZE = 800
+DEFAULT_COSTMAP_RESOLUTION = 0.05
+DEFAULT_COSTMAP_RADIUS = 4
 
 
 def build_costmap(
@@ -123,16 +123,38 @@ def build_costmap(
     mask = (gx >= 0) & (gx < grid_size) & (gz >= 0) & (gz < grid_size)
     gx, gz = gx[mask], gz[mask]
 
-    occ = np.zeros((grid_size, grid_size), dtype=np.uint8)
-    occ[gz, gx] = 255
+    # Accumulate point counts per cell for a density heatmap
+    density = np.zeros((grid_size, grid_size), dtype=np.float32)
+    np.add.at(density, (gz, gx), 1)
+
     if inflate_radius > 0:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (2 * inflate_radius + 1, 2 * inflate_radius + 1),
         )
-        occ = cv2.dilate(occ, kernel)
+        density = cv2.dilate(density, kernel)
 
-    grid[:, :, 0] = occ
+    # Normalize to 0-255 using log scale for better sensitivity
+    density_nz = density[density > 0]
+    if len(density_nz) > 0:
+        log_density = np.zeros_like(density)
+        log_density[density > 0] = np.log1p(density[density > 0])
+        log_max = np.percentile(log_density[log_density > 0], 95)
+        if log_max > 0:
+            heat = np.clip(log_density / log_max * 255, 0, 255).astype(np.uint8)
+        else:
+            heat = np.zeros((grid_size, grid_size), dtype=np.uint8)
+    else:
+        heat = np.zeros((grid_size, grid_size), dtype=np.uint8)
+
+    # Apply colormap: blue (far/sparse) -> red (close/dense)
+    grid = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+    # Black out empty cells
+    grid[heat == 0] = 0
+
+    # Binary occupancy for A* (threshold at any nonzero density)
+    occ = (heat > 0).astype(np.uint8) * 255
+
     cv2.circle(grid, (half_x, cam_z_row), 3, (0, 255, 0), -1)
 
     # A* path planning through waypoints on the BEV grid
