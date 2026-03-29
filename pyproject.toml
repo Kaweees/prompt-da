@@ -26,6 +26,7 @@ dependencies = [
     "open3d ; platform_machine != 'aarch64'",
     "open3d-unofficial-arm ; platform_machine == 'aarch64'",
     "xformers>=0.0.30 ; platform_machine != 'aarch64'",
+    "orbslam3-python>=2.0.0",
 ]
 
 [project.optional-dependencies]
