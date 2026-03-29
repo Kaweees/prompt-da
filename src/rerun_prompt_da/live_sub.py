@@ -40,6 +40,7 @@ from rerun_prompt_da.hardware import (
     k_matrix,
     distortion_coeffs,
 )
+from rerun_prompt_da.motor_controller import motor_control_thread
 from rerun_prompt_da.path_planning import (
     Waypoint,
     astar,
@@ -468,6 +469,13 @@ def main():
     )
     planner.start()
 
+    motor = threading.Thread(
+        target=motor_control_thread,
+        args=(shared, session, stop_event),
+        daemon=True,
+    )
+    motor.start()
+
     # ---- Per-camera state ----
     class CameraState:
         def __init__(self, name: str):
@@ -655,6 +663,7 @@ def main():
     finally:
         stop_event.set()
         planner.join(timeout=2.0)
+        motor.join(timeout=2.0)
         for sub in frame_subs:
             sub.undeclare()
         pose_pub.undeclare()
