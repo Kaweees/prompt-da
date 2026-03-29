@@ -27,8 +27,8 @@ from rerun_prompt_da.motor_controller import VELOCITY_TOPIC
 
 # Mapping from differential-drive (linear, angular) to joystick (accel, steer).
 # The comma body testJoystick: axes[0]=accel (0-0.6 fwd), axes[1]=steer (-1 to 1)
-MAX_LINEAR = 0.3    # m/s from pure pursuit
-MAX_ACCEL = 0.4     # joystick accel range (conservative)
+MAX_LINEAR = 0.9    # m/s (3x speed)
+MAX_ACCEL = 1.2     # joystick accel range (3x speed)
 MAX_STEER = 1.0
 
 DEFAULT_DGX_ENDPOINT = "tcp/100.94.67.9:7447"
@@ -41,7 +41,7 @@ def velocity_to_joystick(linear: float, angular: float) -> tuple[float, float]:
 
     # Positive angular = turning left in diff-drive, but steer axis:
     # negative = left, positive = right. So negate.
-    steer = -(angular / 1.2) * MAX_STEER
+    steer = -(angular / 3.6) * MAX_STEER
     steer = max(-MAX_STEER, min(MAX_STEER, steer))
 
     return accel, steer

@@ -88,11 +88,11 @@ WAYPOINT_STORE_FILE = os.path.expanduser("~/.bodynav/waypoints.json")
 # ---------------------------------------------------------------------------
 # Bodynav conversion constants (must match openpilot/tools/bodynav/body_driver.py)
 # ---------------------------------------------------------------------------
-_BODY_MAX_LINEAR = 0.3   # m/s from pure pursuit
-_BODY_MAX_ACCEL = 0.4    # joystick accel range
+_BODY_MAX_LINEAR = 0.9   # m/s (3x speed)
+_BODY_MAX_ACCEL = 1.2    # joystick accel range (3x speed)
 _BODY_MAX_STEER = 1.0
-_BODY_ANGULAR_SCALE = 1.2
-_BODY_MAX_SPEED = 0.6
+_BODY_ANGULAR_SCALE = 3.6  # rad/s (3x speed)
+_BODY_MAX_SPEED = 1.8
 
 
 def _accel_steer_to_velocity(accel: float, steer: float) -> tuple[float, float]:
@@ -439,15 +439,40 @@ mcp = FastMCP(
 
 @mcp.tool()
 def add_waypoint(x: float, z: float, ctx: Context, label: str = "") -> str:
-    """Add a navigation waypoint at world coordinates (meters).
+    """Add a navigation waypoint and immediately navigate to it via A*.
+
+    Plans a collision-free A* path from the robot's current position to the
+    waypoint using the latest depth-derived costmap, then starts pure-pursuit
+    navigation along the planned trajectory.
 
     x: lateral position (positive = right)
     z: forward distance (positive = ahead of camera)
     label: optional human-readable name
     """
     state: AppState = ctx.request_context.lifespan_context
+
+    # Clear any active direct control to avoid conflicts.
+    state.clear_direct_cmd()
+
     wp = state.add(x, z, label)
-    return f"Added {wp.label} at ({wp.x:.2f}, {wp.z:.2f}). Total: {len(state.waypoints)}"
+    wp_index = len(state.waypoints) - 1
+
+    # Plan an A* path from the robot to the new waypoint.
+    ok, plan_msg = state.plan_path_to(wp.x, wp.z)
+    if not ok:
+        return (
+            f"Added {wp.label} at ({wp.x:.2f}, {wp.z:.2f}), but cannot navigate: {plan_msg} "
+            f"Total: {len(state.waypoints)}"
+        )
+
+    # Send navigation command to start pure-pursuit along the A* path.
+    cmd = {"action": "go", "waypoint_index": wp_index}
+    state.session.put(NAV_COMMAND_TOPIC, json.dumps(cmd).encode())
+
+    return (
+        f"Added {wp.label} at ({wp.x:.2f}, {wp.z:.2f}). {plan_msg} "
+        f"Navigation started — use get_nav_status() to monitor. Total: {len(state.waypoints)}"
+    )
 
 
 @mcp.tool()

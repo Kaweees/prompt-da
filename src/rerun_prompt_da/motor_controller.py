@@ -26,8 +26,8 @@ import zenoh
 
 # ── Comma body physical constants ────────────────────────────────────────
 WHEEL_BASE = 0.235          # metres between left and right wheels
-MAX_LINEAR_VEL = 0.3        # m/s  (conservative for indoor use)
-MAX_ANGULAR_VEL = 1.2       # rad/s
+MAX_LINEAR_VEL = 0.9        # m/s  (3x speed)
+MAX_ANGULAR_VEL = 3.6       # rad/s
 LOOKAHEAD_DIST = 0.35       # metres ahead on the path
 GOAL_TOLERANCE = 0.20       # metres — "arrived" threshold
 SLOWDOWN_DIST = 0.6         # start decelerating within this range
