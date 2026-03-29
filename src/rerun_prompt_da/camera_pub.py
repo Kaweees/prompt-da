@@ -3,7 +3,7 @@ Camera (+ IMU) Publisher — captures frames from webcam, video file, or comma
 device and publishes them over Zenoh for the prompt-da subscriber.
 
 Topics:
-    slam/camera/frame  — grayscale video frames
+    body/camera/wide   — wide camera frames
     slam/imu           — IMU samples (accel + gyro) [comma mode only]
 
 Usage:
@@ -26,7 +26,7 @@ import zenoh
 
 from rerun_prompt_da.hardware import COMMA_STREAM_MAP, DEFAULT_CAMERA_STREAM
 from rerun_prompt_da.zenoh_codec import (
-    FRAME_TOPIC,
+    TOPIC_WIDE,
     IMU_TOPIC,
     encode_frame,
     encode_imu,
@@ -91,7 +91,7 @@ def _run_comma(args, frame_pub, imu_pub):
 
     dt = 1.0 / args.fps
     seq = 0
-    print(f"Publishing frames on '{FRAME_TOPIC}' -- {w}x{h} @ {args.fps} fps")
+    print(f"Publishing frames on '{TOPIC_WIDE}' -- {w}x{h} @ {args.fps} fps")
     print(f"Source: comma device {args.comma} ({args.comma_camera} camera)")
     print("Press Ctrl+C to stop")
 
@@ -151,7 +151,7 @@ def _run_opencv(args, frame_pub):
 
     dt = 1.0 / args.fps
     seq = 0
-    print(f"Publishing frames on '{FRAME_TOPIC}' -- {w}x{h} @ {args.fps} fps")
+    print(f"Publishing frames on '{TOPIC_WIDE}' -- {w}x{h} @ {args.fps} fps")
     print(f"Source: {'webcam' if isinstance(source, int) else source}")
     print("Press Ctrl+C to stop")
 
@@ -225,7 +225,7 @@ def main():
     if args.connect:
         conf.insert_json5("connect/endpoints", f'["{args.connect}"]')
     session = zenoh.open(conf)
-    frame_pub = session.declare_publisher(FRAME_TOPIC)
+    frame_pub = session.declare_publisher(TOPIC_WIDE)
     imu_pub = session.declare_publisher(IMU_TOPIC) if args.imu else None
 
     try:

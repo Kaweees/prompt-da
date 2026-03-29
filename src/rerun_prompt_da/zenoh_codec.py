@@ -2,15 +2,15 @@
 Zenoh pub/sub message encoding and decoding.
 
 Binary wire formats are compatible with the SLAM system (mono_slam)
-so that prompt-da can subscribe to the same camera/IMU topics and
+so that prompt-da can subscribe to the same camera topics and
 publish poses and depth on matching topics.
 
 Topics
 ------
-slam/camera/frame   — grayscale video frames (subscribed)
-slam/imu            — IMU samples             (subscribed)
-slam/pose           — 4x4 camera-to-world pose (published)
-slam/depth          — dense depth map          (published)
+body/camera/wide    — wide camera               (subscribed)
+body/camera/road    — road camera               (subscribed)
+slam/pose           — 4x4 camera-to-world pose  (published)
+slam/depth          — dense depth map           (published)
 """
 
 import struct
@@ -18,10 +18,12 @@ import struct
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Topic names — must match the SLAM publisher / subscriber
+# Topic names — must match the comma body publisher (navigate.py --stream)
 # ---------------------------------------------------------------------------
-FRAME_TOPIC = "slam/camera/frame"
-IMU_TOPIC = "slam/imu"
+CAMERA_TOPICS = {
+    "wide": "body/camera/wide",
+    "road": "body/camera/road",
+}
 POSE_TOPIC = "slam/pose"
 DEPTH_TOPIC = "slam/depth"
 
@@ -46,31 +48,6 @@ def decode_frame(payload: bytes) -> tuple[float, np.ndarray, int]:
         payload[_FRAME_HEADER.size:], dtype=np.uint8
     ).reshape(h, w)
     return timestamp, pixels, seq
-
-
-# ---------------------------------------------------------------------------
-# IMU codec
-# Format: N x [7 x 8B float64] = N x 56B per sample
-#   Each sample: (ax, ay, az, gx, gy, gz, timestamp)
-#   ax/ay/az in m/s^2, gx/gy/gz in rad/s, timestamp in seconds.
-# ---------------------------------------------------------------------------
-_IMU_SAMPLE = struct.Struct("<7d")
-
-
-def encode_imu(samples: list[tuple]) -> bytes:
-    """Encode a batch of IMU samples into bytes."""
-    return b"".join(_IMU_SAMPLE.pack(*s) for s in samples)
-
-
-def decode_imu(
-    payload: bytes,
-) -> list[tuple[float, float, float, float, float, float, float]]:
-    """Decode a binary IMU message into [(ax, ay, az, gx, gy, gz, t), ...]."""
-    n = len(payload) // _IMU_SAMPLE.size
-    return [
-        _IMU_SAMPLE.unpack_from(payload, i * _IMU_SAMPLE.size)
-        for i in range(n)
-    ]
 
 
 # ---------------------------------------------------------------------------
