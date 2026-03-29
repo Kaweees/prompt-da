@@ -7,10 +7,11 @@ publish poses and depth on matching topics.
 
 Topics
 ------
-slam/camera/frame   — grayscale video frames (subscribed)
-slam/imu            — IMU samples             (subscribed)
-slam/pose           — 4x4 camera-to-world pose (published)
-slam/depth          — dense depth map          (published)
+body/camera/wide    — wide-angle road camera   (subscribed)
+body/camera/road    — front road camera         (subscribed)
+slam/imu            — IMU samples               (subscribed)
+slam/pose           — 4x4 camera-to-world pose  (published)
+slam/depth          — dense depth map            (published)
 """
 
 import struct
@@ -18,12 +19,18 @@ import struct
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Topic names — must match the SLAM publisher / subscriber
+# Topic names — must match the comma body publisher (navigate.py --stream)
 # ---------------------------------------------------------------------------
-FRAME_TOPIC = "slam/camera/frame"
+CAMERA_TOPICS = {
+    "wide": "body/camera/wide",
+    "road": "body/camera/road",
+}
 IMU_TOPIC = "slam/imu"
 POSE_TOPIC = "slam/pose"
 DEPTH_TOPIC = "slam/depth"
+
+# Legacy single-topic alias (kept for backward compat with camera_pub.py)
+FRAME_TOPIC = "slam/camera/frame"
 
 # ---------------------------------------------------------------------------
 # Frame codec

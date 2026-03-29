@@ -110,8 +110,8 @@ def compute_cost_map_from_mesh(
     x_min, x_max = xs.min(), xs.max()
     z_min, z_max = zs.min(), zs.max()
 
-    cols = max(1, int(np.ceil((x_max - x_min) / cell_size)))
-    rows = max(1, int(np.ceil((z_max - z_min) / cell_size)))
+    cols = max(1, int(np.ceil((x_max - x_min) / cell_size)) + 1)
+    rows = max(1, int(np.ceil((z_max - z_min) / cell_size)) + 1)
 
     # Bin each vertex into a grid cell
     ci = np.clip(((xs - x_min) / cell_size).astype(int), 0, cols - 1)
@@ -196,6 +196,24 @@ def create_blueprint(parent_log_path: Path) -> rrb.Blueprint:
     return blueprint
 
 
+def log_cost_map(
+    entity_path: str | Path,
+    cost_rgb: np.ndarray,
+    *,
+    origin_x: float,
+    origin_z: float,
+    cell_size: float,
+) -> None:
+    rr.log(
+        str(entity_path),
+        rr.Transform3D(
+            translation=[origin_x, 0.0, origin_z],
+            scale=[cell_size, cell_size, 1.0],
+        ),
+        rr.Image(cost_rgb),
+    )
+
+
 def pda_polycam_inference(
     config: PDAPolycamConfig,
 ) -> None:
@@ -270,7 +288,13 @@ def pda_polycam_inference(
             cost_rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
             cost_rgb[:, :, 0] = (cost_grid * 255).astype(np.uint8)
             cost_rgb[:, :, 1] = ((1 - cost_grid) * 255).astype(np.uint8)
-            rr.log(f"{parent_log_path}/cost_map", rr.Image(cost_rgb))
+            log_cost_map(
+                f"{parent_log_path}/cost_map",
+                cost_rgb,
+                origin_x=origin_x,
+                origin_z=origin_z,
+                cell_size=config.cost_map_resolution,
+            )
 
     # Final mesh and cost map
     pred_mesh = pred_fuser.get_mesh()
@@ -296,7 +320,13 @@ def pda_polycam_inference(
     cost_rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
     cost_rgb[:, :, 0] = (cost_grid * 255).astype(np.uint8)
     cost_rgb[:, :, 1] = ((1 - cost_grid) * 255).astype(np.uint8)
-    rr.log(f"{parent_log_path}/cost_map", rr.Image(cost_rgb))
+    log_cost_map(
+        f"{parent_log_path}/cost_map",
+        cost_rgb,
+        origin_x=origin_x,
+        origin_z=origin_z,
+        cell_size=config.cost_map_resolution,
+    )
     rr.log(
         f"{parent_log_path}/cost_map/metadata",
         rr.TextLog(
