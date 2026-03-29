@@ -157,10 +157,13 @@ def build_costmap(
 
     cv2.circle(grid, (half_x, cam_z_row), 3, (0, 255, 0), -1)
 
-    # A* path planning through waypoints on the BEV grid
-    if waypoints and len(waypoints) >= 2:
-        # Convert occupancy to a normalized cost grid for A*
-        cost_norm = occ.astype(np.float32) / 255.0
+    # A* path planning from current pose through waypoints
+    if waypoints and len(waypoints) >= 1:
+        # Convert density-based heatmap to a normalized cost grid for A*
+        cost_norm = heat.astype(np.float32) / 255.0
+
+        # Current camera position is always at the grid origin marker
+        start_cell = (cam_z_row, half_x)
 
         # Convert world waypoints to BEV grid cells
         wp_cells: list[tuple[int, int]] = []
@@ -169,11 +172,12 @@ def build_costmap(
             gr = int((wp.z - origin_z) / cell_res + cam_z_row)
             wp_cells.append((gr, gc))
 
-        # Plan A* between consecutive waypoint pairs
+        # Plan A* from current pose → WP0 → WP1 → ...
+        all_cells = [start_cell] + wp_cells
         full_path: list[tuple[int, int]] = []
-        for i in range(len(wp_cells) - 1):
+        for i in range(len(all_cells) - 1):
             segment = astar(
-                cost_norm, wp_cells[i], wp_cells[i + 1],
+                cost_norm, all_cells[i], all_cells[i + 1],
                 obstacle_threshold=obstacle_threshold,
             )
             if segment is not None:
@@ -181,18 +185,18 @@ def build_costmap(
                     segment = segment[1:]
                 full_path.extend(segment)
 
-        # Draw path in blue
+        # Draw path as thick cyan line
         for r, c in full_path:
             if 0 <= r < grid_size and 0 <= c < grid_size:
-                grid[r, c] = [0, 100, 255]
+                cv2.circle(grid, (c, r), 2, (255, 200, 0), -1)
 
-        # Draw waypoints as yellow squares
-        for r, c in wp_cells:
-            for dr in range(-2, 3):
-                for dc in range(-2, 3):
+        # Draw waypoints as yellow squares with labels
+        for idx, (r, c) in enumerate(wp_cells):
+            for dr in range(-3, 4):
+                for dc in range(-3, 4):
                     rr_, cc_ = r + dr, c + dc
                     if 0 <= rr_ < grid_size and 0 <= cc_ < grid_size:
-                        grid[rr_, cc_] = [255, 255, 0]
+                        grid[rr_, cc_] = [0, 255, 255]
 
     return grid
 
