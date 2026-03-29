@@ -81,3 +81,46 @@ def distortion_coeffs() -> np.ndarray:
     """Return the KannalaBrandt8 distortion vector [K1, K2, K3, K4]."""
     return np.array([NATIVE_K1, NATIVE_K2, NATIVE_K3, NATIVE_K4],
                     dtype=np.float64)
+
+
+def generate_orbslam_settings(
+    fx: float, fy: float, cx: float, cy: float,
+    w: int, h: int, fps: float = 20.0,
+) -> str:
+    """Generate an ORB-SLAM3 settings YAML for a pinhole camera (post-undistortion)."""
+    return f"""%YAML:1.0
+
+Camera.type: "PinHole"
+
+Camera.fx: {fx}
+Camera.fy: {fy}
+Camera.cx: {cx}
+Camera.cy: {cy}
+
+Camera.k1: 0.0
+Camera.k2: 0.0
+Camera.p1: 0.0
+Camera.p2: 0.0
+
+Camera.width: {w}
+Camera.height: {h}
+Camera.fps: {fps}
+Camera.RGB: 0
+
+ORBextractor.nFeatures: 1000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0
+"""
