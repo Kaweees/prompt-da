@@ -1,7 +1,7 @@
 # Prompt Depth Anything with Rerun
-An unofficial implementation of Prompting Depth Anything for 4K Resolution Accurate Metric Depth Estimation. Using the high resolution depth maps for 3D reconstruction
+An unofficial implementation of Prompting Depth Anything for 4K Resolution Accurate Metric Depth Estimation. Using the high resolution depth maps for 3D reconstruction and traversability cost map generation.
 
-Uses [Rerun](https://rerun.io/) to visualize, [Gradio](https://www.gradio.app) for an interactive UI, and [Pixi](https://pixi.sh/latest/) for a easy installation
+Uses [Rerun](https://rerun.io/) to visualize and [uv](https://docs.astral.sh/uv/) for dependency management.
 
 <p align="center">
   <a title="Website" href="https://rerun.io/" target="_blank" rel="noopener noreferrer" style="display: inline-block;">
@@ -25,31 +25,68 @@ Uses [Rerun](https://rerun.io/) to visualize, [Gradio](https://www.gradio.app) f
 </p>
 
 ## Installation
-### Using Pixi
-Make sure you have the [Pixi](https://pixi.sh/latest/#installation) package manager installed
+
+Make sure you have [uv](https://docs.astral.sh/uv/getting-started/installation/) installed.
+
 ```bash
 git clone https://github.com/rerun-io/prompt-da.git
 cd prompt-da
-pixi run app
+uv sync
 ```
-
-All commands can be listed using `pixi task list`
 
 ## Usage
-### Gradio App
-```
-pixi run app
-```
+
 ### CLI
-with pixi example task
+
+Run inference on a Polycam zip file:
+
 ```bash
-pixi run polycam-prompt_da
+uv run polycam-prompt-da --polycam-zip-path data/6G-room-example.zip
 ```
 
-with python in pixi shell
+With the Rerun web viewer:
+
 ```bash
-python tools/prompt_da_polycam.py --polycam-zip-path $PATH_TO_POLYCAM_ZIP
+uv run polycam-prompt-da --polycam-zip-path data/6G-room-example.zip --rr-config.serve
 ```
+
+Save to an `.rrd` file for later viewing:
+
+```bash
+uv run polycam-prompt-da --polycam-zip-path data/6G-room-example.zip --rr-config.save output.rrd
+uv run rerun output.rrd --web-viewer
+```
+
+### Cost Map
+
+A 2D traversability cost map is generated from the reconstructed mesh after all frames are processed. The cost map is a bird's-eye-view grid projected onto the XZ ground plane, where each cell encodes traversability:
+
+- **Green** (cost 0.0) = flat, traversable ground
+- **Red** (cost 1.0) = obstacle, steep surface, or unobserved
+
+Cost is computed from three components:
+- **Step height** (40%) — height range within a cell vs `--max-step-height`
+- **Roughness** (30%) — height standard deviation (uneven terrain)
+- **Slope** (30%) — surface normal deviation from vertical
+
+Tunable parameters:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cost-map-resolution` | `0.05` | Grid cell size in meters |
+| `--max-step-height` | `0.15` | Max traversable height difference (m) |
+| `--robot-height` | `0.5` | Vertical clearance required (m) |
+
+### Download Example Data
+
+```bash
+huggingface-cli download pablovela5620/polycam-example-data 6G-room-example.zip --repo-type dataset --local-dir data/
+```
+
+### Platform Notes
+
+- **aarch64 (Jetson/Grace)**: `open3d-unofficial-arm` is used automatically. PyTorch is sourced from the cu130 index.
+- **x86_64**: Standard `open3d` and PyTorch CUDA wheels are used.
 
 ## Acknowledgements
 Thanks to the original Prompt DepthAnything and DepthAnythingV2 repos!
@@ -74,7 +111,7 @@ Thanks to the original Prompt DepthAnything and DepthAnythingV2 repos!
 }
 
 @inproceedings{depth_anything_v1,
-  title={Depth Anything: Unleashing the Power of Large-Scale Unlabeled Data}, 
+  title={Depth Anything: Unleashing the Power of Large-Scale Unlabeled Data},
   author={Yang, Lihe and Kang, Bingyi and Huang, Zilong and Xu, Xiaogang and Feng, Jiashi and Zhao, Hengshuang},
   booktitle={CVPR},
   year={2024}

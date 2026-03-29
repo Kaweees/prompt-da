@@ -32,6 +32,12 @@ class PDAPolycamConfig:
     max_depth_range_meter: float = 4.0
     depth_fusion_resolution: float = 0.04
     log_incremental_mesh: bool = True
+    cost_map_resolution: float = 0.05
+    """Grid cell size in meters for the 2D cost map."""
+    max_step_height: float = 0.15
+    """Maximum traversable height difference (meters) within a cell before it becomes an obstacle."""
+    robot_height: float = 0.5
+    """Vertical clearance required by the robot (meters). Cells with height range exceeding this are obstacles."""
 
 
 def log_polycam_data(
@@ -69,6 +75,97 @@ def log_polycam_data(
     rr.log(f"{pinhole_path}/confidence", rr.SegmentationImage(confidence_resized))
     rr.log(f"{pinhole_path}/arkit_depth", rr.DepthImage(depth_resized, meter=1000))
     rr.log(f"{pinhole_path}/pred_depth", rr.DepthImage(depth_pred_resized, meter=1000))
+
+
+def compute_cost_map_from_mesh(
+    mesh: o3d.geometry.TriangleMesh,
+    cell_size: float = 0.05,
+    max_step_height: float = 0.15,
+    robot_height: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Build a 2D traversability cost grid from a 3D mesh.
+
+    Projects mesh vertices onto the XZ ground plane (Y-up / RUB convention).
+    For each grid cell, cost is derived from:
+      - Height variance: rough terrain increases cost
+      - Step height: max - min height in the cell; exceeding max_step_height = obstacle
+      - Surface normals: steep faces increase cost
+
+    Returns:
+        cost_grid: float32 [H, W] with values in [0, 1]. 0 = free, 1 = obstacle.
+        height_grid: float32 [H, W] minimum height per cell (for visualization).
+        origin_x: world X coordinate of grid column 0.
+        origin_z: world Z coordinate of grid row 0.
+    """
+    vertices = np.asarray(mesh.vertices)  # (N, 3) — X right, Y up, Z back
+    if len(vertices) == 0:
+        return np.ones((1, 1), dtype=np.float32), np.zeros((1, 1), dtype=np.float32), 0.0, 0.0
+
+    mesh.compute_vertex_normals()
+    normals = np.asarray(mesh.vertex_normals)  # (N, 3)
+
+    xs, ys, zs = vertices[:, 0], vertices[:, 1], vertices[:, 2]
+
+    # Grid extents
+    x_min, x_max = xs.min(), xs.max()
+    z_min, z_max = zs.min(), zs.max()
+
+    cols = max(1, int(np.ceil((x_max - x_min) / cell_size)))
+    rows = max(1, int(np.ceil((z_max - z_min) / cell_size)))
+
+    # Bin each vertex into a grid cell
+    ci = np.clip(((xs - x_min) / cell_size).astype(int), 0, cols - 1)
+    ri = np.clip(((zs - z_min) / cell_size).astype(int), 0, rows - 1)
+
+    # Per-cell accumulators
+    height_min = np.full((rows, cols), np.inf, dtype=np.float64)
+    height_max = np.full((rows, cols), -np.inf, dtype=np.float64)
+    height_sum = np.zeros((rows, cols), dtype=np.float64)
+    height_sq_sum = np.zeros((rows, cols), dtype=np.float64)
+    normal_y_sum = np.zeros((rows, cols), dtype=np.float64)
+    count = np.zeros((rows, cols), dtype=np.int64)
+
+    # Use np.add.at for unbuffered accumulation
+    np.minimum.at(height_min, (ri, ci), ys)
+    np.maximum.at(height_max, (ri, ci), ys)
+    np.add.at(height_sum, (ri, ci), ys)
+    np.add.at(height_sq_sum, (ri, ci), ys ** 2)
+    np.add.at(normal_y_sum, (ri, ci), np.abs(normals[:, 1]))
+    np.add.at(count, (ri, ci), 1)
+
+    observed = count > 0
+
+    # --- Cost components ---
+
+    # 1. Step height cost: height range in cell vs max_step_height
+    height_range = np.where(observed, height_max - height_min, 0.0)
+    step_cost = np.clip(height_range / max_step_height, 0.0, 1.0)
+
+    # 2. Roughness cost: height standard deviation normalized
+    mean_h = np.where(observed, height_sum / count, 0.0)
+    var_h = np.where(observed, height_sq_sum / count - mean_h ** 2, 0.0)
+    var_h = np.maximum(var_h, 0.0)  # numerical safety
+    std_h = np.sqrt(var_h)
+    roughness_cost = np.clip(std_h / (max_step_height * 0.5), 0.0, 1.0)
+
+    # 3. Slope cost: average surface normal deviation from vertical
+    #    normal_y = 1 means flat ground, 0 means vertical wall
+    avg_normal_y = np.where(observed, normal_y_sum / count, 0.0)
+    slope_cost = np.clip(1.0 - avg_normal_y, 0.0, 1.0)
+
+    # Combined cost (weighted blend)
+    cost = np.where(
+        observed,
+        0.4 * step_cost + 0.3 * roughness_cost + 0.3 * slope_cost,
+        1.0,  # unobserved = obstacle
+    ).astype(np.float32)
+
+    # Hard obstacle: cells where height range exceeds robot clearance
+    cost[height_range > robot_height] = 1.0
+
+    height_grid = np.where(observed, height_min, 0.0).astype(np.float32)
+
+    return cost, height_grid, float(x_min), float(z_min)
 
 
 def filter_depth(
@@ -162,6 +259,20 @@ def pda_polycam_inference(
                 ),
             )
 
+            # Update cost map from current mesh state
+            cost_grid, _height_grid, origin_x, origin_z = compute_cost_map_from_mesh(
+                mesh=pred_mesh,
+                cell_size=config.cost_map_resolution,
+                max_step_height=config.max_step_height,
+                robot_height=config.robot_height,
+            )
+            ch, cw = cost_grid.shape
+            cost_rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
+            cost_rgb[:, :, 0] = (cost_grid * 255).astype(np.uint8)
+            cost_rgb[:, :, 1] = ((1 - cost_grid) * 255).astype(np.uint8)
+            rr.log(f"{parent_log_path}/cost_map", rr.Image(cost_rgb))
+
+    # Final mesh and cost map
     pred_mesh = pred_fuser.get_mesh()
     pred_mesh.compute_vertex_normals()
 
@@ -172,5 +283,25 @@ def pda_polycam_inference(
             triangle_indices=pred_mesh.triangles,
             vertex_normals=pred_mesh.vertex_normals,
             vertex_colors=pred_mesh.vertex_colors,
+        ),
+    )
+
+    cost_grid, _height_grid, origin_x, origin_z = compute_cost_map_from_mesh(
+        mesh=pred_mesh,
+        cell_size=config.cost_map_resolution,
+        max_step_height=config.max_step_height,
+        robot_height=config.robot_height,
+    )
+    ch, cw = cost_grid.shape
+    cost_rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
+    cost_rgb[:, :, 0] = (cost_grid * 255).astype(np.uint8)
+    cost_rgb[:, :, 1] = ((1 - cost_grid) * 255).astype(np.uint8)
+    rr.log(f"{parent_log_path}/cost_map", rr.Image(cost_rgb))
+    rr.log(
+        f"{parent_log_path}/cost_map/metadata",
+        rr.TextLog(
+            f"origin=({origin_x:.2f}, {origin_z:.2f}) "
+            f"cell_size={config.cost_map_resolution}m "
+            f"grid={cw}x{ch} cells"
         ),
     )
