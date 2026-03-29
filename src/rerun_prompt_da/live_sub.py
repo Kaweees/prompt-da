@@ -57,6 +57,9 @@ DEFAULT_COSTMAP_SIZE = 400
 DEFAULT_COSTMAP_RESOLUTION = 0.05
 DEFAULT_COSTMAP_RADIUS = 6
 
+# Replan A* every N frames (not every frame)
+DEFAULT_REPLAN_INTERVAL = 10
+
 # Path topic
 PATH_TOPIC = "slam/path"
 
@@ -309,6 +312,8 @@ def main():
                         help=f"Costmap obstacle inflation radius in cells (default: {DEFAULT_COSTMAP_RADIUS})")
     parser.add_argument("--waypoints", type=str, default=None,
                         help="Navigation waypoints as 'x1,z1;x2,z2;...' in world XZ coords")
+    parser.add_argument("--replan-interval", type=int, default=DEFAULT_REPLAN_INTERVAL,
+                        help=f"Replan path every N frames (default: {DEFAULT_REPLAN_INTERVAL})")
     args = parser.parse_args()
 
     # Parse waypoints
@@ -398,6 +403,10 @@ def main():
             self.undistort_map1 = None
             self.undistort_map2 = None
             self.settings_tmpfile = None
+            self.last_plan_frame = 0
+            self.last_planned_path: list[tuple[int, int]] = []
+            self.last_wp_cells: list[tuple[int, int]] = []
+            self.last_path_world: list[tuple[float, float]] = []
 
     cam_states: dict[str, CameraState] = {}
     shared_slam = None
@@ -408,6 +417,19 @@ def main():
                 cam_name, timestamp, gray, seq = frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
+
+            # Drain queue to latest frame — but only once SLAM is tracking.
+            # During initialization, ORB-SLAM3 needs consecutive frames
+            # with small visual changes to establish feature matches.
+            cs_peek = cam_states.get(cam_name)
+            slam_ok = (cs_peek is not None and cs_peek.slam is not None
+                        and cs_peek.slam.get_tracking_state() == 2)
+            if slam_ok:
+                while not frame_queue.empty():
+                    try:
+                        cam_name, timestamp, gray, seq = frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
 
             # Get or create per-camera state
             if cam_name not in cam_states:
@@ -561,13 +583,18 @@ def main():
                     inflate_radius=args.costmap_radius,
                 )
 
-                # Path planning through waypoints
-                if nav_waypoints and state_str == "OK":
+                # Path planning through waypoints (throttled)
+                should_replan = (
+                    nav_waypoints
+                    and state_str == "OK"
+                    and cs.frame_count - cs.last_plan_frame >= args.replan_interval
+                )
+                if should_replan:
+                    cs.last_plan_frame = cs.frame_count
                     half_x = args.costmap_size // 2
                     cam_z_row = int(args.costmap_size * 0.15)
-                    start_rc = (cam_z_row, half_x)  # camera position on grid
+                    start_rc = (cam_z_row, half_x)
 
-                    # Convert waypoints to grid coords
                     wp_cells = []
                     for wx, wz in nav_waypoints:
                         wr, wc = world_to_grid(
@@ -576,14 +603,13 @@ def main():
                         )
                         wp_cells.append((wr, wc))
 
-                    # Plan path: camera → wp1 → wp2 → ...
                     full_path: list[tuple[int, int]] = []
                     current = start_rc
                     for goal_rc in wp_cells:
                         segment = plan_path(costmap, current, goal_rc)
                         if segment:
                             if full_path:
-                                segment = segment[1:]  # skip duplicate junction
+                                segment = segment[1:]
                             full_path.extend(segment)
                             current = goal_rc
                         else:
@@ -591,10 +617,9 @@ def main():
                                 f"Path planning failed to waypoint ({goal_rc[1]},{goal_rc[0]})"
                             ))
 
-                    # Draw on costmap
-                    draw_path_on_costmap(costmap, full_path, wp_cells)
+                    cs.last_planned_path = full_path
+                    cs.last_wp_cells = wp_cells
 
-                    # Log path in 3D + publish on Zenoh
                     if full_path:
                         path_world = []
                         for pr, pc in full_path:
@@ -603,6 +628,7 @@ def main():
                                 args.costmap_size, args.costmap_resolution,
                             )
                             path_world.append((wx, wz))
+                        cs.last_path_world = path_world
 
                         path_3d = np.array(
                             [[wx, camera_pos[1], wz] for wx, wz in path_world],
@@ -614,7 +640,6 @@ def main():
                             radii=[0.02],
                         ))
 
-                        # Log waypoints in 3D
                         wp_3d = np.array(
                             [[wx, camera_pos[1], wz] for wx, wz in nav_waypoints],
                             dtype=np.float32,
@@ -626,6 +651,10 @@ def main():
                         ))
 
                         path_pub.put(encode_path(timestamp, path_world))
+
+                # Always draw cached path/waypoints on costmap
+                if cs.last_planned_path or cs.last_wp_cells:
+                    draw_path_on_costmap(costmap, cs.last_planned_path, cs.last_wp_cells)
 
                 rr.log(f"costmap/{cam_name}", rr.Image(costmap))
 

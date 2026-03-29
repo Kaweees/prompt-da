@@ -107,7 +107,7 @@ Camera.height: {h}
 Camera.fps: {fps}
 Camera.RGB: 0
 
-ORBextractor.nFeatures: 1000
+ORBextractor.nFeatures: 500
 ORBextractor.scaleFactor: 1.2
 ORBextractor.nLevels: 8
 ORBextractor.iniThFAST: 20
