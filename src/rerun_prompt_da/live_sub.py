@@ -7,7 +7,8 @@ Prompt Depth Anything depth completion, generates traversability cost maps,
 publishes poses and dense depth, and streams everything to Rerun.
 
 Topics subscribed:
-    slam/camera/frame  — grayscale video frames
+    body/camera/wide   — wide-angle road camera frames
+    body/camera/road   — front road camera frames
     slam/imu           — IMU samples (optional)
 
 Topics published:
@@ -31,6 +32,7 @@ import time
 import cv2
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 import zenoh
 
 from rerun_prompt_da.hardware import (
@@ -42,7 +44,7 @@ from rerun_prompt_da.hardware import (
     IMU_DEFAULTS,
 )
 from rerun_prompt_da.zenoh_codec import (
-    FRAME_TOPIC,
+    CAMERA_TOPICS,
     IMU_TOPIC,
     POSE_TOPIC,
     DEPTH_TOPIC,
@@ -125,6 +127,24 @@ def build_costmap(depth_mm: np.ndarray, K: np.ndarray,
     return grid
 
 
+def log_costmap(
+    entity_path: str,
+    costmap: np.ndarray,
+    *,
+    origin_x: float,
+    origin_z: float,
+    cell_size: float,
+) -> None:
+    rr.log(
+        entity_path,
+        rr.Transform3D(
+            translation=[origin_x, 0.0, origin_z],
+            scale=[cell_size, cell_size, 1.0],
+        ),
+        rr.Image(costmap),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Prompt-DA live subscriber (Zenoh + Rerun)")
@@ -161,6 +181,21 @@ def main():
     print(f"Rerun web viewer at {viewer_url}")
     print(f"Rerun gRPC server at {server_uri}")
     rr.log("world", rr.ViewCoordinates.RDF, static=True)
+    rr.send_blueprint(
+        rrb.Blueprint(
+            rrb.Horizontal(
+                rrb.Spatial3DView(origin="world"),
+                rrb.Vertical(
+                    rrb.Spatial2DView(origin="world/wide/image"),
+                    rrb.Spatial2DView(origin="world/wide/depth"),
+                    rrb.Spatial2DView(origin="world/road/image"),
+                    rrb.Spatial2DView(origin="world/road/depth"),
+                ),
+                column_shares=[20, 9],
+            ),
+            collapse_panels=True,
+        )
+    )
 
     # ---- Zenoh setup ----
     conf = zenoh.Config()
@@ -172,10 +207,12 @@ def main():
     pose_pub = session.declare_publisher(POSE_TOPIC)
     depth_pub = session.declare_publisher(DEPTH_TOPIC)
 
-    def _on_frame(sample):
-        payload = sample.payload.to_bytes()
-        timestamp, gray, seq = decode_frame(payload)
-        frame_queue.put((timestamp, gray, seq))
+    def _make_frame_cb(cam_name):
+        def _on_frame(sample):
+            payload = sample.payload.to_bytes()
+            timestamp, gray, seq = decode_frame(payload)
+            frame_queue.put((cam_name, timestamp, gray, seq))
+        return _on_frame
 
     imu_buffer: list = []
     imu_lock = threading.Lock()
@@ -186,47 +223,66 @@ def main():
         with imu_lock:
             imu_buffer.extend(samples)
 
-    print(f"Subscribing to '{FRAME_TOPIC}' -- waiting for frames...")
+    frame_subs = []
+    for cam_name, topic in CAMERA_TOPICS.items():
+        sub = session.declare_subscriber(topic, _make_frame_cb(cam_name))
+        frame_subs.append(sub)
+        print(f"Subscribing to '{topic}' ({cam_name})")
     if args.imu:
         print(f"Subscribing to '{IMU_TOPIC}' for IMU data")
     print(f"Publishing poses on '{POSE_TOPIC}'")
     print(f"Publishing depth on '{DEPTH_TOPIC}'")
+    print("Waiting for frames...")
 
-    frame_sub = session.declare_subscriber(FRAME_TOPIC, _on_frame)
     imu_sub = session.declare_subscriber(IMU_TOPIC, _on_imu) if args.imu else None
 
-    # ---- Lazy-init model and camera params on first frame ----
-    model = None
-    K = None
-    focal = None
-    cx = cy = 0.0
-    w = h = 0
-    frame_count = 0
-    last_timestamp = None
-    dropped_nonmonotonic = 0
-    last_depth_mm = None
-    last_pose_wc = None
-    undistort_map1 = None
-    undistort_map2 = None
+    # ---- Per-camera state ----
+    # Each camera gets its own model init, intrinsics, undistortion maps,
+    # depth state, and frame counter.
+    class CameraState:
+        def __init__(self, name: str):
+            self.name = name
+            self.model = None
+            self.K = None
+            self.focal = None
+            self.cx = self.cy = 0.0
+            self.w = self.h = 0
+            self.frame_count = 0
+            self.last_timestamp = None
+            self.dropped_nonmonotonic = 0
+            self.last_depth_mm = None
+            self.last_pose_wc = None
+            self.undistort_map1 = None
+            self.undistort_map2 = None
+
+    cam_states: dict[str, CameraState] = {}
+
+    # Shared model (loaded once, used for all cameras)
+    shared_model = None
 
     try:
         while True:
             try:
-                timestamp, gray, seq = frame_queue.get(timeout=1.0)
+                cam_name, timestamp, gray, seq = frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
 
+            # Get or create per-camera state
+            if cam_name not in cam_states:
+                cam_states[cam_name] = CameraState(cam_name)
+            cs = cam_states[cam_name]
+
             # Non-monotonic timestamp check
-            if args.drop_nonmonotonic and last_timestamp is not None and timestamp <= last_timestamp:
-                dropped_nonmonotonic += 1
-                if dropped_nonmonotonic <= 5 or dropped_nonmonotonic % 30 == 0:
+            if args.drop_nonmonotonic and cs.last_timestamp is not None and timestamp <= cs.last_timestamp:
+                cs.dropped_nonmonotonic += 1
+                if cs.dropped_nonmonotonic <= 5 or cs.dropped_nonmonotonic % 30 == 0:
                     print(
-                        f"Dropping non-monotonic frame: "
-                        f"ts={timestamp:.6f} <= last={last_timestamp:.6f} "
-                        f"(dropped={dropped_nonmonotonic})"
+                        f"[{cam_name}] Dropping non-monotonic frame: "
+                        f"ts={timestamp:.6f} <= last={cs.last_timestamp:.6f} "
+                        f"(dropped={cs.dropped_nonmonotonic})"
                     )
                 continue
-            last_timestamp = timestamp
+            cs.last_timestamp = timestamp
 
             # Drain IMU samples
             imu_samples = None
@@ -236,124 +292,130 @@ def main():
                         imu_samples = list(imu_buffer)
                         imu_buffer.clear()
 
-            # Lazy-init on first frame
-            if model is None:
-                h, w = gray.shape[:2]
-                print(f"First frame: {w}x{h}, initializing Prompt-DA ({args.depth_model})...")
+            # Lazy-init on first frame for this camera
+            if cs.model is None:
+                cs.h, cs.w = gray.shape[:2]
+                print(f"[{cam_name}] First frame: {cs.w}x{cs.h}, initializing...")
 
-                from monopriors.depth_completion_models.prompt_da import PromptDAPredictor
-                model = PromptDAPredictor(
-                    device="cuda",
-                    model_type=args.depth_model,
-                    max_size=args.max_image_size,
-                )
+                if shared_model is None:
+                    print(f"Loading Prompt-DA ({args.depth_model})...")
+                    from monopriors.depth_completion_models.prompt_da import PromptDAPredictor
+                    shared_model = PromptDAPredictor(
+                        device="cuda",
+                        model_type=args.depth_model,
+                        max_size=args.max_image_size,
+                    )
+                cs.model = shared_model
 
                 # Camera intrinsics scaled to frame width
-                K_fisheye = k_matrix(w)
+                K_fisheye = k_matrix(cs.w)
                 D = distortion_coeffs().reshape(4, 1)
 
                 if args.focal:
-                    focal = args.focal
-                    cx, cy = w / 2.0, h / 2.0
+                    cs.focal = args.focal
+                    cs.cx, cs.cy = cs.w / 2.0, cs.h / 2.0
                 else:
-                    fx, fy, cx, cy = scaled_intrinsics(w)
-                    focal = fx
+                    fx, fy, cs.cx, cs.cy = scaled_intrinsics(cs.w)
+                    cs.focal = fx
 
-                # Build the undistorted (pinhole) intrinsic matrix.
-                # After undistortion the image is rectilinear so we use
-                # the same focal length but re-center the principal point.
                 K_undistorted = np.array([
-                    [focal, 0.0, cx],
-                    [0.0,  focal, cy],
+                    [cs.focal, 0.0, cs.cx],
+                    [0.0,  cs.focal, cs.cy],
                     [0.0,  0.0,  1.0],
                 ], dtype=np.float64)
 
-                # Pre-compute fisheye undistortion remap tables (done once)
-                undistort_map1, undistort_map2 = cv2.fisheye.initUndistortRectifyMap(
-                    K_fisheye, D, np.eye(3), K_undistorted, (w, h), cv2.CV_16SC2,
+                cs.undistort_map1, cs.undistort_map2 = cv2.fisheye.initUndistortRectifyMap(
+                    K_fisheye, D, np.eye(3), K_undistorted, (cs.w, cs.h), cv2.CV_16SC2,
                 )
+                cs.K = K_undistorted
 
-                # Use the undistorted K for all downstream geometry
-                K = K_undistorted
+                print(f"[{cam_name}] Camera: focal={cs.focal:.1f} cx={cs.cx:.1f} cy={cs.cy:.1f}")
+                print(f"[{cam_name}] Fisheye undistortion enabled")
 
-                print(f"Camera: focal={focal:.1f} cx={cx:.1f} cy={cy:.1f}")
-                print(f"Distortion (KannalaBrandt8 K1-K4): {D.ravel()}")
-                print(f"Fisheye undistortion enabled (cv2.fisheye.initUndistortRectifyMap)")
-                print(f"IMU freq: {IMU_DEFAULTS['Frequency']} Hz")
-
-            # ---- Undistort fisheye frame using OS04C10 distortion coefficients ----
-            gray = cv2.remap(gray, undistort_map1, undistort_map2,
+            # ---- Undistort fisheye frame ----
+            gray = cv2.remap(gray, cs.undistort_map1, cs.undistort_map2,
                              interpolation=cv2.INTER_LINEAR)
 
-            frame_count += 1
-            rr.set_time("frame", sequence=frame_count)
+            cs.frame_count += 1
+            rr.set_time("frame", sequence=cs.frame_count)
             rr.set_time("timestamp", timestamp=timestamp)
 
             # ---- Run depth completion every N frames ----
-            run_depth = (frame_count % args.depth_every) == 1 or args.depth_every == 1
+            run_depth = (cs.frame_count % args.depth_every) == 1 or args.depth_every == 1
 
             if run_depth:
-                # PromptDA expects RGB; replicate grayscale to 3-channel
                 rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
-                # Use previous depth as prompt if available, else zeros
-                prompt_depth = last_depth_mm if last_depth_mm is not None else np.zeros((h, w), dtype=np.uint16)
+                PROMPT_H, PROMPT_W = 192, 256
+                if cs.last_depth_mm is not None:
+                    prompt_depth = cv2.resize(cs.last_depth_mm, (PROMPT_W, PROMPT_H), interpolation=cv2.INTER_NEAREST)
+                else:
+                    prompt_depth = np.zeros((PROMPT_H, PROMPT_W), dtype=np.uint16)
 
-                depth_pred = model(rgb=rgb, prompt_depth=prompt_depth)
-                depth_mm = depth_pred.depth_mm  # uint16, millimeters
+                depth_pred = cs.model(rgb=rgb, prompt_depth=prompt_depth)
+                depth_mm = depth_pred.depth_mm
 
-                # Clamp to max range
                 max_mm = int(args.max_depth_range * 1000)
                 depth_mm[depth_mm > max_mm] = 0
+                cs.last_depth_mm = depth_mm
 
-                last_depth_mm = depth_mm
-
-                # Publish depth over Zenoh
                 depth_pub.put(encode_depth(timestamp, depth_mm))
 
-                # Log depth to Rerun
-                rr.log("world/camera/depth", rr.DepthImage(depth_mm, meter=1000))
-
+                rr.log(f"world/{cam_name}/depth", rr.DepthImage(depth_mm, meter=1000))
                 rr.log("prompt_da/state", rr.TextLog(
-                    f"frame={frame_count} depth_completed "
+                    f"[{cam_name}] frame={cs.frame_count} depth_completed "
                     f"valid_px={int(np.count_nonzero(depth_mm))} "
                     f"max={float(depth_mm.max()) / 1000:.2f}m"
                 ))
 
             # ---- Log camera image ----
-            rr.log("world/camera/image", rr.Pinhole(
-                focal_length=[focal, focal],
-                principal_point=[cx, cy],
-                resolution=[w, h],
+            rr.log(f"world/{cam_name}", rr.Pinhole(
+                focal_length=[cs.focal, cs.focal],
+                principal_point=[cs.cx, cs.cy],
+                resolution=[cs.w, cs.h],
                 camera_xyz=rr.ViewCoordinates.RDF,
-            ))
-            rr.log("world/camera/image", rr.Image(gray))
+            ), static=True)
+            rr.log(f"world/{cam_name}/image", rr.Image(gray))
 
             # ---- Costmap from latest depth ----
-            if last_depth_mm is not None:
-                costmap = build_costmap(last_depth_mm, K, last_pose_wc)
-                rr.log("costmap", rr.Image(costmap))
+            if cs.last_depth_mm is not None:
+                costmap = build_costmap(cs.last_depth_mm, cs.K, cs.last_pose_wc)
+                if cs.last_pose_wc is not None:
+                    costmap_origin_x = float(cs.last_pose_wc[0, 3]) - COSTMAP_HALF * COSTMAP_RESOLUTION
+                    costmap_origin_z = float(cs.last_pose_wc[2, 3]) - COSTMAP_HALF * COSTMAP_RESOLUTION
+                else:
+                    costmap_origin_x = -COSTMAP_HALF * COSTMAP_RESOLUTION
+                    costmap_origin_z = -COSTMAP_HALF * COSTMAP_RESOLUTION
+                log_costmap(
+                    f"costmap/{cam_name}",
+                    costmap,
+                    origin_x=costmap_origin_x,
+                    origin_z=costmap_origin_z,
+                    cell_size=COSTMAP_RESOLUTION,
+                )
 
             # ---- Status ----
-            if frame_count % 30 == 0:
-                has_depth = "+" if last_depth_mm is not None else "-"
+            if cs.frame_count % 30 == 0:
+                has_depth = "+" if cs.last_depth_mm is not None else "-"
                 print(
-                    f"[{frame_count}] depth={has_depth} "
+                    f"[{cam_name}:{cs.frame_count}] depth={has_depth} "
                     f"imu_samples={'n/a' if imu_samples is None else len(imu_samples)}"
                 )
 
     except KeyboardInterrupt:
         print("\nStopping subscriber")
     finally:
-        frame_sub.undeclare()
+        for sub in frame_subs:
+            sub.undeclare()
         if imu_sub:
             imu_sub.undeclare()
         pose_pub.undeclare()
         depth_pub.undeclare()
         session.close()
-        if dropped_nonmonotonic:
-            print(f"Dropped {dropped_nonmonotonic} non-monotonic frames")
-        print(f"Processed {frame_count} frames")
+        for cs in cam_states.values():
+            if cs.dropped_nonmonotonic:
+                print(f"[{cs.name}] Dropped {cs.dropped_nonmonotonic} non-monotonic frames")
+            print(f"[{cs.name}] Processed {cs.frame_count} frames")
 
 
 if __name__ == "__main__":
