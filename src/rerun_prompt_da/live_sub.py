@@ -184,7 +184,7 @@ def main():
                         help="Run depth completion every N frames (default: 5)")
     parser.add_argument("--max-image-size", type=int, default=1008,
                         help="Max image size for PromptDA inference (default: 1008)")
-    parser.add_argument("--max-depth-range", type=float, default=4.0,
+    parser.add_argument("--max-depth-range", type=float, default=20.0,
                         help="Maximum depth range in meters (default: 4.0)")
     parser.add_argument("--focal", type=float, default=None,
                         help="Override focal length (default: OS04C10 intrinsics scaled to frame)")
@@ -391,9 +391,9 @@ def main():
                 if cs.last_depth_mm is not None:
                     prompt_depth = cv2.resize(cs.last_depth_mm, (PROMPT_W, PROMPT_H), interpolation=cv2.INTER_NEAREST)
                 else:
-                    prompt_depth = np.full((PROMPT_H, PROMPT_W), 2000, dtype=np.uint16)
-                    prompt_depth[0, 0] = 500
-                    prompt_depth[-1, -1] = 4000
+                    prompt_depth = np.full((PROMPT_H, PROMPT_W), 3000, dtype=np.uint16)
+                    prompt_depth[0, 0] = 200
+                    prompt_depth[-1, -1] = 20000
 
                 depth_pred = cs.model(rgb=rgb_model, prompt_depth=prompt_depth)
                 depth_mm = depth_pred.depth_mm
