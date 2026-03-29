@@ -1,53 +1,50 @@
-"""Comma body hardware bridge — translates velocity commands to wheel motors.
+"""Comma body hardware bridge — translates DGX velocity commands to testJoystick.
 
-Subscribes to ``body/control/velocity`` on Zenoh and forwards the commands
-to the comma body's differential-drive wheels.
+Subscribes to ``body/control/velocity`` on Zenoh and converts (linear, angular)
+differential-drive velocities into testJoystick (accel, steer) axes that
+joystickd understands.
 
-On the comma device the bridge talks to the body board via cereal / CAN.
+This bridges the DGX path planner to the comma body's existing motor control.
+Must run on the comma body alongside the agent.
+
 On a dev machine it runs in **dry-run** mode (logs commands to stdout).
 
 Usage
 -----
     uv run body-driver                          # dry-run (no hardware)
-    uv run body-driver --comma 192.168.1.10     # real comma body
+    uv run body-driver --dgx tcp/192.168.1.100:7447  # real comma body
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import struct
 import time
 
 import zenoh
 
 from rerun_prompt_da.motor_controller import VELOCITY_TOPIC
 
-# CAN arbitration IDs for the comma body motor controller.
-# These match the body board firmware (see openpilot/selfdrive/body/).
-MOTOR_CMD_ADDR = 0x250          # left-speed + right-speed
-MOTOR_CMD_BUS = 0
+# Mapping from differential-drive (linear, angular) to joystick (accel, steer).
+# The comma body testJoystick: axes[0]=accel (0-0.6 fwd), axes[1]=steer (-1 to 1)
+MAX_LINEAR = 0.3    # m/s from pure pursuit
+MAX_ACCEL = 0.4     # joystick accel range (conservative)
+MAX_STEER = 1.0
 
-# Speed is sent as int16 in units of ~0.001 m/s (firmware-dependent).
-SPEED_SCALE = 1000.0
-MAX_SPEED_TICKS = 500           # clamp for safety
-
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+DEFAULT_DGX_ENDPOINT = "tcp/100.94.67.9:7447"
 
 
-def _build_motor_can_msg(left: float, right: float) -> bytes:
-    """Pack left/right wheel speeds into an 8-byte CAN payload.
+def velocity_to_joystick(linear: float, angular: float) -> tuple[float, float]:
+    """Convert (linear m/s, angular rad/s) to (accel, steer) axes."""
+    accel = (linear / MAX_LINEAR) * MAX_ACCEL if MAX_LINEAR > 0 else 0.0
+    accel = max(-MAX_ACCEL, min(MAX_ACCEL, accel))
 
-    Format matches the comma body motor controller expectation:
-        bytes 0-1: int16 left  (big-endian, units ≈ 0.001 m/s)
-        bytes 2-3: int16 right (big-endian, units ≈ 0.001 m/s)
-        bytes 4-7: reserved / zero
-    """
-    lt = int(_clamp(left * SPEED_SCALE, -MAX_SPEED_TICKS, MAX_SPEED_TICKS))
-    rt = int(_clamp(right * SPEED_SCALE, -MAX_SPEED_TICKS, MAX_SPEED_TICKS))
-    return struct.pack(">hh4x", lt, rt)
+    # Positive angular = turning left in diff-drive, but steer axis:
+    # negative = left, positive = right. So negate.
+    steer = -(angular / 1.2) * MAX_STEER
+    steer = max(-MAX_STEER, min(MAX_STEER, steer))
+
+    return accel, steer
 
 
 class DryRunDriver:
@@ -56,79 +53,89 @@ class DryRunDriver:
     def __init__(self):
         self._last_print = 0.0
 
-    def send(self, left: float, right: float):
+    def send(self, linear: float, angular: float):
+        accel, steer = velocity_to_joystick(linear, angular)
         now = time.monotonic()
-        if now - self._last_print > 0.25:          # throttle output
-            print(f"[dry-run] L={left:+.3f}  R={right:+.3f} m/s")
+        if now - self._last_print > 0.25:
+            print(f"[dry-run] linear={linear:+.3f} angular={angular:+.3f} -> accel={accel:+.3f} steer={steer:+.3f}")
             self._last_print = now
 
 
 class CommaBodyDriver:
-    """Send wheel commands to the comma body via cereal CAN."""
+    """Send testJoystick cereal messages to drive the comma body."""
 
-    def __init__(self, addr: str):
+    def __init__(self):
         import cereal.messaging as messaging
-        self._pm = messaging.PubMaster(["sendcan"])
-        self._addr = addr
-        print(f"CommaBodyDriver: connected to {addr}")
+        from openpilot.common.params import Params
+        Params().put_bool('JoystickDebugMode', True)
+        self._pm = messaging.PubMaster(['testJoystick'])
+        print("CommaBodyDriver: JoystickDebugMode enabled, publishing testJoystick")
 
-    def send(self, left: float, right: float):
+    def send(self, linear: float, angular: float):
         import cereal.messaging as messaging
-        from cereal import car
+        accel, steer = velocity_to_joystick(linear, angular)
 
-        can_data = _build_motor_can_msg(left, right)
-
-        msg = messaging.new_message("sendcan", 1)
-        msg.sendcan[0].address = MOTOR_CMD_ADDR
-        msg.sendcan[0].busTime = 0
-        msg.sendcan[0].dat = can_data
-        msg.sendcan[0].src = MOTOR_CMD_BUS
-        self._pm.send("sendcan", msg)
+        joy_msg = messaging.new_message('testJoystick')
+        joy_msg.valid = True
+        joy_msg.testJoystick.axes = [accel, steer]
+        self._pm.send('testJoystick', joy_msg)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Comma body motor driver")
+    parser = argparse.ArgumentParser(description="DGX velocity -> comma testJoystick bridge")
     parser.add_argument(
-        "--comma", type=str, default=None, metavar="ADDR",
-        help="Comma device IP.  Omit for dry-run mode.",
+        "--dgx", type=str, default=None, metavar="ENDPOINT",
+        help=f"DGX Zenoh endpoint (default: {DEFAULT_DGX_ENDPOINT})",
     )
     parser.add_argument(
         "--connect", type=str, default=None,
         help="Zenoh router endpoint (e.g. tcp/localhost:7447)",
     )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print commands instead of sending to hardware",
+    )
     args = parser.parse_args()
 
     # Select driver backend.
-    if args.comma:
-        driver = CommaBodyDriver(args.comma)
-    else:
-        print("No --comma specified, running in dry-run mode")
+    if args.dry_run:
+        print("Running in dry-run mode")
         driver = DryRunDriver()
+    else:
+        driver = CommaBodyDriver()
 
     # Zenoh setup.
     conf = zenoh.Config()
-    if args.connect:
-        conf.insert_json5("connect/endpoints", f'["{args.connect}"]')
+    endpoint = args.dgx or args.connect or DEFAULT_DGX_ENDPOINT
+    conf.insert_json5("connect/endpoints", f'["{endpoint}"]')
     session = zenoh.open(conf)
 
+    last_cmd_time = 0.0
+
     def _on_velocity(sample):
+        nonlocal last_cmd_time
         try:
             msg = json.loads(sample.payload.to_bytes().decode())
-            left = float(msg.get("left", 0.0))
-            right = float(msg.get("right", 0.0))
-            driver.send(left, right)
+            linear = float(msg.get("linear", 0.0))
+            angular = float(msg.get("angular", 0.0))
+            driver.send(linear, angular)
+            last_cmd_time = time.monotonic()
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError):
             pass
 
     sub = session.declare_subscriber(VELOCITY_TOPIC, _on_velocity)
     print(f"Body driver: subscribed to '{VELOCITY_TOPIC}'")
-    print("Press Ctrl+C to stop")
+    print(f"Connected to DGX at {endpoint}")
+    print("Forwarding velocity commands to testJoystick. Ctrl+C to stop.")
 
     try:
         while True:
-            time.sleep(1.0)
+            time.sleep(0.5)
+            # Safety: if no commands for 1s, send zero
+            if time.monotonic() - last_cmd_time > 1.0 and last_cmd_time > 0:
+                driver.send(0.0, 0.0)
     except KeyboardInterrupt:
-        print("\nStopping body driver")
+        print("\nBody driver stopped.")
     finally:
         sub.undeclare()
         session.close()

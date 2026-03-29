@@ -68,8 +68,9 @@ def scaled_intrinsics(target_w: int) -> tuple[float, float, float, float]:
     )
 
 
-def k_matrix(target_w: int) -> np.ndarray:
+def k_matrix(target_w: int | float) -> np.ndarray:
     """Return a 3x3 camera intrinsic matrix scaled to *target_w*."""
+    target_w = int(target_w)
     fx, fy, cx, cy = scaled_intrinsics(target_w)
     return np.array([
         [fx, 0.0, cx],
