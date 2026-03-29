@@ -22,6 +22,8 @@ dependencies = [
     "tqdm",
     "simplecv",
     "monopriors",
+    "depth-anything-3",
+    "gsplat",
     "eclipse-zenoh>=1.8.0",
     "open3d ; platform_machine != 'aarch64'",
     "open3d-unofficial-arm ; platform_machine == 'aarch64'",
@@ -34,6 +36,7 @@ comma = ["cereal"]
 polycam-prompt-da = "rerun_prompt_da.cli:main"
 prompt-da-sub = "rerun_prompt_da.live_sub:main"
 prompt-da-pub = "rerun_prompt_da.camera_pub:main"
+bodynav-view = "rerun_prompt_da.bodynav_view:main"
 
 [build-system]
 build-backend = "hatchling.build"
@@ -42,13 +45,26 @@ requires = ["hatchling"]
 [tool.uv.sources]
 simplecv = { git = "https://github.com/pablovela5620/simplecv.git" }
 monopriors = { git = "https://github.com/pablovela5620/monoprior.git" }
+gsplat = { git = "https://github.com/nerfstudio-project/gsplat.git", rev = "0b4dddf04cb687367602c01196913cde6a743d70" }
 torch = { index = "pytorch-cu130" }
 onnxruntime-gpu = { index = "jetson-ai-lab" }
 
 [tool.uv]
 override-dependencies = [
   "onnxruntime-gpu ; platform_machine != 'aarch64'",
+  "numpy>=2.0",
+  "open3d ; platform_machine != 'aarch64'",
+  "open3d-unofficial-arm ; platform_machine == 'aarch64'",
+  "pycolmap ; platform_machine != 'aarch64'",
 ]
+
+required-environments = [
+  "sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.extra-build-dependencies]
+gsplat = ["torch"]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
