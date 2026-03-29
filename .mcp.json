@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "prompt-da-waypoints": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/home/kaweees/Documents/prompt-da",
+        "run",
+        "prompt-da-mcp"
+      ],
+      "env": {}
+    }
+  }
+}

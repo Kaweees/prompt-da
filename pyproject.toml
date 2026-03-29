@@ -25,6 +25,7 @@ dependencies = [
     "depth-anything-3",
     "gsplat",
     "eclipse-zenoh>=1.8.0",
+    "mcp>=1.12.0",
     "open3d ; platform_machine != 'aarch64'",
     "open3d-unofficial-arm ; platform_machine == 'aarch64'",
 ]
@@ -37,6 +38,7 @@ polycam-prompt-da = "rerun_prompt_da.cli:main"
 prompt-da-sub = "rerun_prompt_da.live_sub:main"
 prompt-da-pub = "rerun_prompt_da.camera_pub:main"
 bodynav-view = "rerun_prompt_da.bodynav_view:main"
+prompt-da-mcp = "rerun_prompt_da.waypoint_mcp:main"
 
 [build-system]
 build-backend = "hatchling.build"
