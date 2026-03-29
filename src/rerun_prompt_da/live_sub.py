@@ -349,6 +349,14 @@ def main():
                 depth_pred = cs.model(rgb=rgb, prompt_depth=prompt_depth)
                 depth_mm = depth_pred.depth_mm
 
+                # Resize depth to match camera resolution so the Rerun point
+                # cloud aligns with the pinhole intrinsics.
+                if depth_mm.shape[:2] != (cs.h, cs.w):
+                    depth_mm = cv2.resize(
+                        depth_mm, (cs.w, cs.h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+
                 max_mm = int(args.max_depth_range * 1000)
                 depth_mm[depth_mm > max_mm] = 0
                 cs.last_depth_mm = depth_mm
