@@ -394,6 +394,16 @@ def main():
                         help="Initial waypoints as x1 z1 x2 z2 ... in world meters")
     parser.add_argument("--obstacle-threshold", type=float, default=0.8,
                         help="Cost threshold for impassable cells (default: 0.8)")
+    parser.add_argument("--enable-rag", action="store_true",
+                        help="Enable spatio-temporal RAG (requires [rag] extras)")
+    parser.add_argument("--qdrant-url", type=str, default="http://kaweees-dgx-spark.local:6333",
+                        help="Qdrant server URL (default: http://kaweees-dgx-spark.local:6333)")
+    parser.add_argument("--clip-host", type=str, default=None,
+                        help="gRPC CLIP server host (default: derive from qdrant-url, or local)")
+    parser.add_argument("--force-local-clip", action="store_true",
+                        help="Force local CLIP instead of gRPC")
+    parser.add_argument("--new-memory", action="store_true",
+                        help="Drop and recreate spatial memory collections on startup")
     args = parser.parse_args()
 
     # Parse initial waypoints from flat list: x1 z1 x2 z2 ...
@@ -475,6 +485,56 @@ def main():
         daemon=True,
     )
     motor.start()
+
+    # ---- Spatio-temporal RAG (optional) ----
+    spatial_mem = None
+    temporal_mem = None
+    rag_robot_pose = [0.0, 0.0, 0.0]
+
+    if args.enable_rag:
+        try:
+            from rerun_prompt_da.strag.clip_embedder import make_embedder
+            from rerun_prompt_da.strag.spatial_memory import SpatialMemory
+            from rerun_prompt_da.strag.entity_graph_db import EntityGraphDB
+            from rerun_prompt_da.strag.temporal_memory import TemporalMemory, TemporalMemoryConfig
+            from rerun_prompt_da.strag.config import DB_DIR, OLLAMA_URL
+            import os
+            from pathlib import Path
+
+            clip_host = args.clip_host
+            embedder = make_embedder(clip_host=clip_host, force_local=args.force_local_clip)
+
+            spatial_mem = SpatialMemory(
+                qdrant_url=args.qdrant_url,
+                embedder=embedder,
+                new_memory=args.new_memory,
+            )
+            print(f"RAG: SpatialMemory connected to {args.qdrant_url}")
+
+            db_path = Path(DB_DIR) / "entity_graph.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            entity_db = EntityGraphDB(db_path=db_path)
+
+            tm_cfg = TemporalMemoryConfig(
+                vlm_backend="openai" if os.environ.get("OPENAI_API_KEY") else "ollama",
+                openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
+                ollama_url=OLLAMA_URL,
+            )
+            temporal_mem = TemporalMemory(
+                config=tm_cfg,
+                db=entity_db,
+                jsonl_path=Path(DB_DIR) / "temporal.jsonl",
+            )
+            temporal_mem.start()
+            print("RAG: TemporalMemory started")
+        except ImportError as e:
+            print(f"RAG: Failed to import strag modules ({e}). Install with: uv pip install -e '.[rag]'")
+            spatial_mem = None
+            temporal_mem = None
+        except Exception as e:
+            print(f"RAG: Initialization failed ({e}). Continuing without RAG.")
+            spatial_mem = None
+            temporal_mem = None
 
     # ---- Per-camera state ----
     class CameraState:
@@ -612,6 +672,20 @@ def main():
                     f"max={float(depth_mm.max()) / 1000:.2f}m"
                 ))
 
+                # ---- Feed to RAG spatial memory ----
+                if spatial_mem is not None:
+                    spatial_mem.store_frame(
+                        rgb,
+                        pos_x=rag_robot_pose[0],
+                        pos_y=rag_robot_pose[1],
+                        pos_z=rag_robot_pose[2],
+                    )
+
+            # ---- Feed to RAG temporal memory ----
+            if temporal_mem is not None:
+                temporal_mem.add_frame(gray, timestamp=timestamp)
+                temporal_mem.update_pose(*rag_robot_pose)
+
             # ---- Log camera image ----
             rr.log(f"world/{cam_name}", rr.Pinhole(
                 focal_length=[cs.focal, cs.focal],
@@ -661,6 +735,9 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping subscriber")
     finally:
+        if temporal_mem is not None:
+            temporal_mem.stop()
+            print("RAG: TemporalMemory stopped")
         stop_event.set()
         planner.join(timeout=2.0)
         motor.join(timeout=2.0)

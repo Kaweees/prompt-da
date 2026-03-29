@@ -192,6 +192,13 @@ class AppState:
         self.vel_publisher = vel_publisher
         self.waypoints: list[WaypointEntry] = []
 
+        # Spatio-temporal RAG (optional, set via init_rag)
+        self.rag_client = None
+        self.spatial_memory = None
+        self.temporal_memory = None
+        self.entity_db = None
+        self._rag_robot_pose: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
         # Latest camera frame + depth (populated by background subscribers).
         self._latest_frame: np.ndarray | None = None
         self._latest_frame_ts: float = 0.0
@@ -414,9 +421,55 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppState]:
     )
     repeater.start()
 
+    # ---- Spatio-temporal RAG (optional) ----
+    rag_qdrant_url = os.environ.get("RAG_QDRANT_URL", "")
+    if rag_qdrant_url:
+        try:
+            from rerun_prompt_da.strag.clip_embedder import make_embedder
+            from rerun_prompt_da.strag.spatial_memory import SpatialMemory
+            from rerun_prompt_da.strag.entity_graph_db import EntityGraphDB
+            from rerun_prompt_da.strag.temporal_memory import TemporalMemory, TemporalMemoryConfig
+            from rerun_prompt_da.strag.rag_client import RagClient
+            from rerun_prompt_da.strag.config import DB_DIR, OLLAMA_URL
+            from pathlib import Path
+
+            clip_host = os.environ.get("RAG_CLIP_HOST")
+            embedder = make_embedder(
+                clip_host=clip_host,
+                force_local=os.environ.get("RAG_FORCE_LOCAL_CLIP", "") == "1",
+            )
+            state.spatial_memory = SpatialMemory(
+                qdrant_url=rag_qdrant_url, embedder=embedder,
+            )
+            db_path = Path(DB_DIR) / "entity_graph.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            state.entity_db = EntityGraphDB(db_path=db_path)
+
+            tm_cfg = TemporalMemoryConfig(
+                vlm_backend="openai" if os.environ.get("OPENAI_API_KEY") else "ollama",
+                openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
+                ollama_url=OLLAMA_URL,
+            )
+            state.temporal_memory = TemporalMemory(
+                config=tm_cfg, db=state.entity_db,
+                jsonl_path=Path(DB_DIR) / "temporal_mcp.jsonl",
+            )
+            state.temporal_memory.start()
+
+            state.rag_client = RagClient(
+                state.spatial_memory, state.entity_db, state.temporal_memory,
+            )
+            print(f"Waypoint MCP: RAG enabled (Qdrant={rag_qdrant_url})")
+        except ImportError as e:
+            print(f"Waypoint MCP: RAG import failed ({e}). Install with: uv pip install -e '.[rag]'")
+        except Exception as e:
+            print(f"Waypoint MCP: RAG init failed ({e}). Continuing without RAG.")
+
     try:
         yield state
     finally:
+        if state.temporal_memory is not None:
+            state.temporal_memory.stop()
         stop_event.set()
         repeater.join(timeout=2.0)
         state.clear_direct_cmd()
@@ -585,6 +638,108 @@ def capture_scene(ctx: Context) -> str:
         "use add_waypoint to mark interesting locations."
     )
     return "\n".join(results)
+
+
+# =========================================================================
+# Spatio-temporal RAG tools (requires RAG_QDRANT_URL env var)
+# =========================================================================
+
+@mcp.tool()
+def navigate_to_location(description: str, ctx: Context) -> str:
+    """Navigate to a semantically described location from spatial memory.
+
+    Uses CLIP text-to-image search to find previously visited locations
+    matching the description (e.g. "kitchen", "doorway", "near the chair").
+    If found, plans an A* path and starts navigation.
+
+    description: natural language description of the destination
+    """
+    state: AppState = ctx.request_context.lifespan_context
+    if state.rag_client is None:
+        return "RAG not enabled. Set RAG_QDRANT_URL env var to enable."
+
+    loc = state.rag_client.find_location(description)
+    if loc is None:
+        return f"Location '{description}' not found in spatial memory."
+
+    x, z = loc["pos_x"], loc.get("pos_y", 0.0)
+    source = loc.get("source", "unknown")
+    name = loc.get("name", description)
+
+    state.clear_direct_cmd()
+    wp = state.add(x, z, name)
+    wp_index = len(state.waypoints) - 1
+
+    ok, plan_msg = state.plan_path_to(wp.x, wp.z)
+    if not ok:
+        return (
+            f"Found '{name}' at ({x:.2f}, {z:.2f}) via {source}, "
+            f"but cannot navigate: {plan_msg}"
+        )
+
+    cmd = {"action": "go", "waypoint_index": wp_index}
+    state.session.put(NAV_COMMAND_TOPIC, json.dumps(cmd).encode())
+
+    return (
+        f"Found '{name}' at ({x:.2f}, {z:.2f}) via {source}. "
+        f"{plan_msg} Navigation started."
+    )
+
+
+@mcp.tool()
+def query_scene(question: str, ctx: Context) -> str:
+    """Ask a question about the environment using spatio-temporal memory.
+
+    Uses temporal memory (VLM entity extraction) and the entity graph
+    to answer questions like "What objects are near the desk?" or
+    "Where is the person?".
+
+    question: natural language question about the scene
+    """
+    state: AppState = ctx.request_context.lifespan_context
+    if state.rag_client is None:
+        return "RAG not enabled. Set RAG_QDRANT_URL env var to enable."
+
+    return state.rag_client.answer_question(question)
+
+
+@mcp.tool()
+def tag_current_location(name: str, ctx: Context, description: str = "") -> str:
+    """Tag the robot's current position with a name for future navigation.
+
+    Stores a named location in spatial memory so you can later navigate
+    to it using navigate_to_location().
+
+    name: short name for this location (e.g. "kitchen", "charging_station")
+    description: optional detailed description
+    """
+    state: AppState = ctx.request_context.lifespan_context
+    if state.spatial_memory is None:
+        return "RAG not enabled. Set RAG_QDRANT_URL env var to enable."
+
+    x, y = state._rag_robot_pose[0], state._rag_robot_pose[1]
+    state.spatial_memory.tag_location(
+        name=name,
+        description=description or name,
+        pos_x=x, pos_y=y,
+    )
+    return f"Tagged '{name}' at ({x:.2f}, {y:.2f})."
+
+
+@mcp.tool()
+def get_spatial_context(ctx: Context) -> str:
+    """Get RAG context about the robot's current surroundings.
+
+    Returns a formatted summary combining nearby visual frames from
+    Qdrant spatial memory and entity relationships from the graph database.
+    """
+    state: AppState = ctx.request_context.lifespan_context
+    if state.rag_client is None:
+        return "RAG not enabled. Set RAG_QDRANT_URL env var to enable."
+
+    x, y = state._rag_robot_pose[0], state._rag_robot_pose[1]
+    rag_ctx = state.rag_client.build_context(x, y)
+    return rag_ctx.formatted
 
 
 # =========================================================================

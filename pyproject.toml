@@ -32,6 +32,19 @@ dependencies = [
 
 [project.optional-dependencies]
 comma = ["cereal"]
+rag = [
+    "qdrant-client",
+    "openai",
+    "httpx",
+    "langchain-core",
+    "langchain-openai",
+    "langgraph",
+    "fastapi",
+    "uvicorn",
+    "grpcio",
+    "grpcio-tools",
+    "requests",
+]
 
 [project.scripts]
 polycam-prompt-da = "rerun_prompt_da.cli:main"
@@ -40,6 +53,8 @@ prompt-da-pub = "rerun_prompt_da.camera_pub:main"
 bodynav-view = "rerun_prompt_da.bodynav_view:main"
 prompt-da-mcp = "rerun_prompt_da.waypoint_mcp:main"
 body-driver = "rerun_prompt_da.body_driver:main"
+strag-setup = "rerun_prompt_da.strag.qdrant_setup:main_cli"
+strag-example = "rerun_prompt_da.strag.example:main_cli"
 
 [build-system]
 build-backend = "hatchling.build"
