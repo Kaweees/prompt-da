@@ -78,6 +78,10 @@ class SharedState:
         self.path_cells: list[tuple[int, int]] = []
         self.waypoint_cells: list[tuple[int, int]] = []
 
+        # Rerun time context — written by mapping, read by planning
+        self._rr_frame: int = 0
+        self._rr_timestamp: float = 0.0
+
         # Grid geometry (immutable after init)
         self.grid_size = grid_size
         self.cell_res = cell_res
@@ -92,6 +96,18 @@ class SharedState:
     def get_cost_grid(self) -> np.ndarray | None:
         with self.lock:
             return self.cost_grid.copy() if self.cost_grid is not None else None
+
+    def update_rr_time(self, frame: int, timestamp: float):
+        with self.lock:
+            self._rr_frame = frame
+            self._rr_timestamp = timestamp
+
+    def apply_rr_time(self):
+        """Set Rerun time context on the calling thread from the latest mapping values."""
+        with self.lock:
+            f, t = self._rr_frame, self._rr_timestamp
+        rr.set_time("frame", sequence=f)
+        rr.set_time("timestamp", timestamp=t)
 
     # -- planning → mapping --------------------------------------------------
     def update_overlay(
@@ -290,7 +306,10 @@ def planning_thread(
 
         shared.update_overlay(full_path, wp_cells)
 
-        # Log path and waypoints to Rerun for 3D visualization
+        # Sync Rerun time context from the mapping thread so entities
+        # appear on the same "frame" / "timestamp" timelines.
+        shared.apply_rr_time()
+
         if full_path:
             path_xz = np.array(
                 [((c - shared.half_x) * shared.cell_res, 0.0,
@@ -549,12 +568,81 @@ def main():
             self.last_timestamp = None
             self.dropped_nonmonotonic = 0
             self.last_depth_mm = None
-            self.last_pose_wc = None
+            self.last_pose_wc = np.eye(4, dtype=np.float64)
             self.undistort_map1 = None
             self.undistort_map2 = None
+            self.prev_gray = None
+            self.prev_keypoints = None
+            self.prev_descriptors = None
+
+    orb = cv2.ORB_create(nfeatures=1000)
+    bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+    VO_MAX_ROTATION_DEG = 8.0
+    VO_MIN_INLIER_RATIO = 0.25
+    VO_MIN_GOOD_MATCHES = 20
+
+    def update_vo(cs: CameraState, gray_frame: np.ndarray):
+        """Frame-to-frame visual odometry via ORB + Essential matrix.
+
+        Rejects updates where the rotation is implausibly large (sensor noise
+        when stationary) or the inlier ratio is too low.
+        """
+        kp, des = orb.detectAndCompute(gray_frame, None)
+        if des is None or cs.prev_descriptors is None:
+            cs.prev_gray = gray_frame
+            cs.prev_keypoints = kp
+            cs.prev_descriptors = des
+            return
+
+        matches = bf_matcher.knnMatch(cs.prev_descriptors, des, k=2)
+        good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+
+        if len(good) < VO_MIN_GOOD_MATCHES:
+            cs.prev_gray = gray_frame
+            cs.prev_keypoints = kp
+            cs.prev_descriptors = des
+            return
+
+        pts1 = np.float32([cs.prev_keypoints[m.queryIdx].pt for m in good])
+        pts2 = np.float32([kp[m.trainIdx].pt for m in good])
+
+        K_64 = cs.K.astype(np.float64) if cs.K is not None else np.eye(3)
+        E, mask = cv2.findEssentialMat(pts1, pts2, K_64, method=cv2.RANSAC, threshold=1.0)
+        if E is None or mask is None:
+            cs.prev_gray = gray_frame
+            cs.prev_keypoints = kp
+            cs.prev_descriptors = des
+            return
+
+        inlier_ratio = float(mask.sum()) / len(good)
+        if inlier_ratio < VO_MIN_INLIER_RATIO:
+            cs.prev_gray = gray_frame
+            cs.prev_keypoints = kp
+            cs.prev_descriptors = des
+            return
+
+        n_inliers, R, t, _ = cv2.recoverPose(E, pts1, pts2, K_64, mask=mask)
+
+        angle_rad = np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))
+        if np.degrees(angle_rad) > VO_MAX_ROTATION_DEG:
+            cs.prev_gray = gray_frame
+            cs.prev_keypoints = kp
+            cs.prev_descriptors = des
+            return
+
+        dT = np.eye(4, dtype=np.float64)
+        dT[:3, :3] = R
+        dT[:3, 3] = t.ravel()
+        cs.last_pose_wc = cs.last_pose_wc @ dT
+
+        cs.prev_gray = gray_frame
+        cs.prev_keypoints = kp
+        cs.prev_descriptors = des
 
     cam_states: dict[str, CameraState] = {}
     shared_model = None
+    global_frame: int = 0
 
     try:
         while True:
@@ -615,6 +703,13 @@ def main():
                 )
                 cs.K = K_undistorted
 
+                rr.log(f"world/{cam_name}", rr.Pinhole(
+                    focal_length=[cs.focal, cs.focal],
+                    principal_point=[cs.cx, cs.cy],
+                    resolution=[cs.w, cs.h],
+                    camera_xyz=rr.ViewCoordinates.RDF,
+                ), static=True)
+
                 print(f"[{cam_name}] Camera: focal={cs.focal:.1f} cx={cs.cx:.1f} cy={cs.cy:.1f}")
                 print(f"[{cam_name}] Fisheye undistortion enabled")
 
@@ -623,8 +718,19 @@ def main():
                              interpolation=cv2.INTER_LINEAR)
 
             cs.frame_count += 1
-            rr.set_time("frame", sequence=cs.frame_count)
+            global_frame += 1
+            rr.set_time("frame", sequence=global_frame)
             rr.set_time("timestamp", timestamp=timestamp)
+            shared.update_rr_time(global_frame, timestamp)
+
+            # ---- Update visual odometry & publish pose ----
+            update_vo(cs, gray)
+            pose_pub.put(encode_pose(timestamp, cs.last_pose_wc, "tracking"))
+
+            if spatial_mem is not None or temporal_mem is not None:
+                rag_robot_pose[0] = cs.last_pose_wc[0, 3]
+                rag_robot_pose[1] = cs.last_pose_wc[1, 3]
+                rag_robot_pose[2] = cs.last_pose_wc[2, 3]
 
             # ---- Run depth completion every N frames ----
             run_depth = (cs.frame_count % args.depth_every) == 1 or args.depth_every == 1
@@ -686,14 +792,17 @@ def main():
                 temporal_mem.add_frame(gray, timestamp=timestamp)
                 temporal_mem.update_pose(*rag_robot_pose)
 
-            # ---- Log camera image ----
-            rr.log(f"world/{cam_name}", rr.Pinhole(
-                focal_length=[cs.focal, cs.focal],
-                principal_point=[cs.cx, cs.cy],
-                resolution=[cs.w, cs.h],
-                camera_xyz=rr.ViewCoordinates.RDF,
-            ), static=True)
+            # ---- Log camera pose + image ----
+            if cs.last_pose_wc is not None:
+                rr.log(f"world/{cam_name}", rr.Transform3D(
+                    mat3x3=cs.last_pose_wc[:3, :3],
+                    translation=cs.last_pose_wc[:3, 3],
+                ))
             rr.log(f"world/{cam_name}/image", rr.Image(gray))
+
+            # Re-log depth every frame so the 3D point cloud persists
+            if cs.last_depth_mm is not None:
+                rr.log(f"world/{cam_name}/depth", rr.DepthImage(cs.last_depth_mm, meter=1000))
 
             # ---- Costmap: build + overlay from planning thread ----
             if cs.last_depth_mm is not None:

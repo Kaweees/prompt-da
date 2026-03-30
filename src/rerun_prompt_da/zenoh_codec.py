@@ -22,7 +22,6 @@ import numpy as np
 # ---------------------------------------------------------------------------
 CAMERA_TOPICS = {
     "wide": "body/camera/wide",
-    "road": "body/camera/road",
 }
 POSE_TOPIC = "slam/pose"
 DEPTH_TOPIC = "slam/depth"

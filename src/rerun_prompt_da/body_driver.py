@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
+import subprocess
 import time
 
 import zenoh
@@ -32,6 +35,7 @@ MAX_ACCEL = 1.2     # joystick accel range (3x speed)
 MAX_STEER = 1.0
 
 DEFAULT_DGX_ENDPOINT = "tcp/100.94.67.9:7447"
+TOPIC = "testJoystick"
 
 
 def velocity_to_joystick(linear: float, angular: float) -> tuple[float, float]:
@@ -61,24 +65,78 @@ class DryRunDriver:
             self._last_print = now
 
 
+def _kill_competing_publishers():
+    """Kill other body_driver / joystick processes and remove stale IPC sockets."""
+    my_pid = os.getpid()
+    for pattern in ("body_driver", "joystick.py"):
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True, text=True,
+            )
+            for line in result.stdout.strip().splitlines():
+                pid = int(line.strip())
+                if pid != my_pid:
+                    print(f"Killing competing process ({pattern}) pid={pid}")
+                    os.kill(pid, signal.SIGKILL)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+
+    # msgq uses shared-memory files for IPC; remove the stale binding
+    for path in (f"/dev/shm/{TOPIC}", f"/tmp/{TOPIC}"):
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+                print(f"Removed stale IPC socket: {path}")
+        except OSError:
+            pass
+
+    time.sleep(0.3)
+
+
 class CommaBodyDriver:
     """Send testJoystick cereal messages to drive the comma body."""
 
     def __init__(self):
         import cereal.messaging as messaging
         from openpilot.common.params import Params
+
+        _kill_competing_publishers()
+
         Params().put_bool('JoystickDebugMode', True)
-        self._pm = messaging.PubMaster(['testJoystick'])
-        print("CommaBodyDriver: JoystickDebugMode enabled, publishing testJoystick")
+        self._messaging = messaging
+        self._pm = messaging.PubMaster([TOPIC])
+        self._send_errors = 0
+        print(f"CommaBodyDriver: JoystickDebugMode enabled, publishing {TOPIC}")
+
+    def _recreate_publisher(self):
+        """Tear down and recreate the PubMaster after a socket conflict."""
+        print(f"Recreating PubMaster for {TOPIC}...")
+        _kill_competing_publishers()
+        try:
+            del self._pm
+        except AttributeError:
+            pass
+        self._pm = self._messaging.PubMaster([TOPIC])
+        self._send_errors = 0
 
     def send(self, linear: float, angular: float):
-        import cereal.messaging as messaging
         accel, steer = velocity_to_joystick(linear, angular)
 
-        joy_msg = messaging.new_message('testJoystick')
+        joy_msg = self._messaging.new_message(TOPIC)
         joy_msg.valid = True
         joy_msg.testJoystick.axes = [accel, steer]
-        self._pm.send('testJoystick', joy_msg)
+        try:
+            self._pm.send(TOPIC, joy_msg)
+            self._send_errors = 0
+        except Exception as exc:
+            self._send_errors += 1
+            if self._send_errors <= 3:
+                print(f"Send error ({self._send_errors}/3): {exc}")
+                self._recreate_publisher()
+            elif self._send_errors == 4:
+                print("Persistent publisher conflict — suppressing further errors. "
+                      "Make sure no other process is publishing to testJoystick.")
 
 
 def main():
@@ -122,6 +180,8 @@ def main():
             last_cmd_time = time.monotonic()
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError):
             pass
+        except Exception as exc:
+            print(f"callback error: {exc}")
 
     sub = session.declare_subscriber(VELOCITY_TOPIC, _on_velocity)
     print(f"Body driver: subscribed to '{VELOCITY_TOPIC}'")
