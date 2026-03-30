@@ -137,23 +137,30 @@ def build_costmap(
     y_min: float = -0.5,
     y_max: float = 2.0,
     cam_z_frac: float = 0.15,
+    stride: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Project depth into a BEV costmap.
 
     Returns (grid_rgb, cost_norm) where cost_norm is float32 [0,1] for A*.
+    stride > 1 subsamples the depth image for speed.
     """
     half_x = grid_size // 2
     cam_z_row = int(grid_size * cam_z_frac)
     grid = np.zeros((grid_size, grid_size, 3), dtype=np.uint8)
     cost_norm = np.zeros((grid_size, grid_size), dtype=np.float32)
 
-    h, w = depth_mm.shape[:2]
-    valid = depth_mm > 0
+    if stride > 1:
+        depth_sub = depth_mm[::stride, ::stride]
+    else:
+        depth_sub = depth_mm
+    valid = depth_sub > 0
     if not np.any(valid):
         return grid, cost_norm
 
-    ys_px, xs_px = np.where(valid)
-    depths = depth_mm[valid].astype(np.float32) / 1000.0
+    ys_sub, xs_sub = np.where(valid)
+    ys_px = ys_sub * stride if stride > 1 else ys_sub
+    xs_px = xs_sub * stride if stride > 1 else xs_sub
+    depths = depth_mm[ys_px, xs_px].astype(np.float32) / 1000.0
 
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
@@ -385,10 +392,10 @@ def main():
         description="Prompt-DA live subscriber (Zenoh + Rerun)")
     parser.add_argument("--depth-model", default="large", choices=["large"],
                         help="Prompt-DA model size (default: large)")
-    parser.add_argument("--depth-every", type=int, default=5,
-                        help="Run depth completion every N frames (default: 5)")
-    parser.add_argument("--max-image-size", type=int, default=1008,
-                        help="Max image size for PromptDA inference (default: 1008)")
+    parser.add_argument("--depth-every", type=int, default=1,
+                        help="Run depth completion every N frames (default: 1)")
+    parser.add_argument("--max-image-size", type=int, default=518,
+                        help="Max image size for PromptDA inference (default: 518)")
     parser.add_argument("--max-depth-range", type=float, default=20.0,
                         help="Maximum depth range in meters (default: 20.0)")
     parser.add_argument("--focal", type=float, default=None,
@@ -644,18 +651,49 @@ def main():
     shared_model = None
     global_frame: int = 0
 
+    # ---- Async depth inference ----
+    depth_in_q: queue.Queue = queue.Queue(maxsize=1)
+    depth_out_q: queue.Queue = queue.Queue(maxsize=1)
+
+    def _depth_worker():
+        while not stop_event.is_set():
+            try:
+                req = depth_in_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            cam_name_d, rgb_model, prompt_depth, orig_hw, max_mm, ts = req
+            pred = shared_model(rgb=rgb_model, prompt_depth=prompt_depth)
+            dm = pred.depth_mm
+            h, w = orig_hw
+            if dm.shape[:2] != (h, w):
+                dm = cv2.resize(dm, (w, h), interpolation=cv2.INTER_NEAREST)
+            dm[dm > max_mm] = 0
+            while not depth_out_q.empty():
+                try:
+                    depth_out_q.get_nowait()
+                except queue.Empty:
+                    break
+            depth_out_q.put((cam_name_d, dm, ts))
+
+    depth_thread_started = False
+
     try:
         while True:
+            # ---- Get latest frame, drop stale ones ----
             try:
                 cam_name, timestamp, gray, seq = frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
+            while not frame_queue.empty():
+                try:
+                    cam_name, timestamp, gray, seq = frame_queue.get_nowait()
+                except queue.Empty:
+                    break
 
             if cam_name not in cam_states:
                 cam_states[cam_name] = CameraState(cam_name)
             cs = cam_states[cam_name]
 
-            # Non-monotonic timestamp check
             if args.drop_nonmonotonic and cs.last_timestamp is not None and timestamp <= cs.last_timestamp:
                 cs.dropped_nonmonotonic += 1
                 if cs.dropped_nonmonotonic <= 5 or cs.dropped_nonmonotonic % 30 == 0:
@@ -667,7 +705,7 @@ def main():
                 continue
             cs.last_timestamp = timestamp
 
-            # Lazy-init on first frame for this camera
+            # ---- Lazy-init on first frame ----
             if cs.model is None:
                 cs.h, cs.w = gray.shape[:2]
                 print(f"[{cam_name}] First frame: {cs.w}x{cs.h}, initializing...")
@@ -681,6 +719,10 @@ def main():
                         max_size=args.max_image_size,
                     )
                 cs.model = shared_model
+
+                if not depth_thread_started:
+                    threading.Thread(target=_depth_worker, daemon=True).start()
+                    depth_thread_started = True
 
                 K_fisheye = k_matrix(cs.w)
                 D = distortion_coeffs().reshape(4, 1)
@@ -713,7 +755,7 @@ def main():
                 print(f"[{cam_name}] Camera: focal={cs.focal:.1f} cx={cs.cx:.1f} cy={cs.cy:.1f}")
                 print(f"[{cam_name}] Fisheye undistortion enabled")
 
-            # ---- Undistort fisheye frame ----
+            # ---- Undistort ----
             gray = cv2.remap(gray, cs.undistort_map1, cs.undistort_map2,
                              interpolation=cv2.INTER_LINEAR)
 
@@ -723,7 +765,7 @@ def main():
             rr.set_time("timestamp", timestamp=timestamp)
             shared.update_rr_time(global_frame, timestamp)
 
-            # ---- Update visual odometry & publish pose ----
+            # ---- VO + pose ----
             update_vo(cs, gray)
             pose_pub.put(encode_pose(timestamp, cs.last_pose_wc, "tracking"))
 
@@ -732,12 +774,10 @@ def main():
                 rag_robot_pose[1] = cs.last_pose_wc[1, 3]
                 rag_robot_pose[2] = cs.last_pose_wc[2, 3]
 
-            # ---- Run depth completion every N frames ----
+            # ---- Submit depth request (non-blocking) ----
             run_depth = (cs.frame_count % args.depth_every) == 1 or args.depth_every == 1
-
             if run_depth:
                 rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-
                 h_in, w_in = rgb.shape[:2]
                 _model_scale = args.max_image_size / max(h_in, w_in)
                 _model_h = int(h_in * _model_scale) // 14 * 14
@@ -750,77 +790,65 @@ def main():
 
                 PROMPT_H, PROMPT_W = 192, 256
                 if cs.last_depth_mm is not None:
-                    prompt_depth = cv2.resize(cs.last_depth_mm, (PROMPT_W, PROMPT_H), interpolation=cv2.INTER_NEAREST)
+                    prompt_depth = cv2.resize(cs.last_depth_mm, (PROMPT_W, PROMPT_H),
+                                             interpolation=cv2.INTER_NEAREST)
                 else:
                     prompt_depth = np.full((PROMPT_H, PROMPT_W), 3000, dtype=np.uint16)
                     prompt_depth[0, 0] = 200
                     prompt_depth[-1, -1] = 20000
 
-                depth_pred = cs.model(rgb=rgb_model, prompt_depth=prompt_depth)
-                depth_mm = depth_pred.depth_mm
-
-                if depth_mm.shape[:2] != (cs.h, cs.w):
-                    depth_mm = cv2.resize(
-                        depth_mm, (cs.w, cs.h),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-
                 max_mm = int(args.max_depth_range * 1000)
-                depth_mm[depth_mm > max_mm] = 0
-                cs.last_depth_mm = depth_mm
+                try:
+                    depth_in_q.put_nowait(
+                        (cam_name, rgb_model, prompt_depth, (cs.h, cs.w), max_mm, timestamp)
+                    )
+                except queue.Full:
+                    pass
 
-                depth_pub.put(encode_depth(timestamp, depth_mm))
+            # ---- Collect depth result (non-blocking) ----
+            try:
+                result_cam, depth_mm, depth_ts = depth_out_q.get_nowait()
+                rcs = cam_states[result_cam]
+                rcs.last_depth_mm = depth_mm
 
-                rr.log(f"world/{cam_name}/depth", rr.DepthImage(depth_mm, meter=1000))
-                rr.log("prompt_da/state", rr.TextLog(
-                    f"[{cam_name}] frame={cs.frame_count} depth_completed "
-                    f"valid_px={int(np.count_nonzero(depth_mm))} "
-                    f"max={float(depth_mm.max()) / 1000:.2f}m"
-                ))
+                depth_pub.put(encode_depth(depth_ts, depth_mm))
+                rr.log(f"world/{result_cam}/depth", rr.DepthImage(depth_mm, meter=1000))
 
-                # ---- Feed to RAG spatial memory ----
+                costmap, cost_norm = build_costmap(
+                    depth_mm, rcs.K, rcs.last_pose_wc,
+                    grid_size=args.costmap_size,
+                    cell_res=args.costmap_resolution,
+                    inflate_radius=args.costmap_radius,
+                    stride=4,
+                )
+                shared.update_cost_grid(cost_norm)
+                path_cells, wp_cells = shared.get_overlay()
+                draw_overlay(costmap, path_cells, wp_cells)
+                rr.log(f"costmap/{result_cam}", rr.Image(costmap))
+
                 if spatial_mem is not None:
+                    rag_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
                     spatial_mem.store_frame(
-                        rgb,
+                        rag_rgb,
                         pos_x=rag_robot_pose[0],
                         pos_y=rag_robot_pose[1],
                         pos_z=rag_robot_pose[2],
                     )
+            except queue.Empty:
+                pass
 
-            # ---- Feed to RAG temporal memory ----
+            # ---- RAG temporal memory (every frame) ----
             if temporal_mem is not None:
                 temporal_mem.add_frame(gray, timestamp=timestamp)
                 temporal_mem.update_pose(*rag_robot_pose)
 
-            # ---- Log camera pose + image ----
+            # ---- Log pose + image ----
             if cs.last_pose_wc is not None:
                 rr.log(f"world/{cam_name}", rr.Transform3D(
                     mat3x3=cs.last_pose_wc[:3, :3],
                     translation=cs.last_pose_wc[:3, 3],
                 ))
             rr.log(f"world/{cam_name}/image", rr.Image(gray))
-
-            # Re-log depth every frame so the 3D point cloud persists
-            if cs.last_depth_mm is not None:
-                rr.log(f"world/{cam_name}/depth", rr.DepthImage(cs.last_depth_mm, meter=1000))
-
-            # ---- Costmap: build + overlay from planning thread ----
-            if cs.last_depth_mm is not None:
-                costmap, cost_norm = build_costmap(
-                    cs.last_depth_mm, cs.K, cs.last_pose_wc,
-                    grid_size=args.costmap_size,
-                    cell_res=args.costmap_resolution,
-                    inflate_radius=args.costmap_radius,
-                )
-
-                # Push cost grid to planning thread
-                shared.update_cost_grid(cost_norm)
-
-                # Pull path + waypoints from planning thread and draw
-                path_cells, wp_cells = shared.get_overlay()
-                draw_overlay(costmap, path_cells, wp_cells)
-
-                rr.log(f"costmap/{cam_name}", rr.Image(costmap))
 
             # ---- Status ----
             if cs.frame_count % 30 == 0:
